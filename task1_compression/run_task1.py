@@ -42,6 +42,7 @@ import os
 import random
 import sys
 import time
+import traceback
 import warnings
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -827,8 +828,22 @@ def run(cfg: dict, conditions: List[str], load_model: Optional[Callable] = None)
             print(f"[skip] {name}: summary.json exists (use --overwrite)")
             status[name] = "skipped"
             continue
-        run_condition(name, cfg, load_model, get_stats, calib_ids)
+        err_path = root / name / "error.json"
+        try:
+            run_condition(name, cfg, load_model, get_stats, calib_ids)
+        except Exception as e:
+            err = {"condition": name, "exception_type": type(e).__name__,
+                   "message": str(e), "traceback": traceback.format_exc()}
+            _write_json(err_path, err, indent=1)
+            print(f"[FAILED] {name}: {err['exception_type']}: {err['message']}\n{err['traceback']}")
+            _free(cfg["device"])
+            status[name] = "failed"
+            continue
+        if err_path.exists():
+            err_path.unlink()
         status[name] = "done"
+    for name, st in status.items():
+        print(f"[status] {name}: {st}")
     holder.clear()
     _free(cfg["device"])
     return status
