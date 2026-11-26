@@ -10,7 +10,7 @@ Excluded from compression:
 """
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import json
 
 import torch
@@ -103,6 +103,125 @@ def count_eligible_params(model) -> Dict[str, int]:
         total += n
     counts["total"] = total
     return counts
+
+
+def exact_row_prune_mask(scores: torch.Tensor, n_zero: int) -> torch.Tensor:
+    """
+    Boolean keep-mask (True = keep) that zeros EXACTLY ``n_zero`` entries per row:
+    the ``n_zero`` smallest scores in each row.
+
+    This replaces the previous threshold-plus-tie-fixup logic, which over-pruned
+    whenever the per-row threshold value was shared by more columns than needed
+    (e.g. dead input channels scoring exactly 0): ``scores > threshold`` zeroed
+    *all* ties, and the fix-up branch (which only ever *added* zeros) never ran
+    because its counter was already ≤ 0.  The result was achieved-sparsity drift,
+    which breaks the matched-sparsity P1/P2/P3 comparison required by PDF §1
+    ("What to Watch For": eligible-weight sparsity of P3 must equal P1/P2).
+
+    ``torch.topk(..., largest=False)`` selects exactly ``n_zero`` indices per row,
+    so the achieved per-row sparsity is exactly ``n_zero / d_in`` regardless of ties.
+    """
+    d_out, d_in = scores.shape
+    if n_zero <= 0:
+        return torch.ones(d_out, d_in, dtype=torch.bool, device=scores.device)
+    if n_zero >= d_in:
+        return torch.zeros(d_out, d_in, dtype=torch.bool, device=scores.device)
+    _, zero_idx = torch.topk(scores, n_zero, dim=1, largest=False, sorted=False)
+    mask = torch.ones(d_out, d_in, dtype=torch.bool, device=scores.device)
+    mask.scatter_(1, zero_idx, False)
+    return mask
+
+
+class CalibStats:
+    """
+    Memory-efficient sufficient statistics of the calibration inputs to ONE
+    projection, replacing storage of the full (n_tokens, d_in) activation matrix.
+
+    Storing raw activations for every eligible projection at the PDF §1 calibration
+    size (128 seqs × 512 tokens ≈ 65k rows) costs ~Σ d_in × 65k × 4 B — well over
+    100 GB for Qwen2.5-1.5B and a guaranteed OOM.  Every downstream consumer only
+    needs a reduction over the token axis, so we accumulate those reductions online:
+
+      col_sqnorm  (d_in,)       sqrt(Σ_t x_t²)  == Wanda column norm ||X_{:,j}||₂
+      col_absmean (d_in,)       (1/N) Σ_t |x_t|  (AWQ activation scale / Q3 sensitivity)
+      gram        (d_in, d_in)  Σ_t x_t x_tᵀ     (exact AWQ reconstruction error) or None
+      n_tokens    int
+
+    The Gram matrix is an exact sufficient statistic for the AWQ Frobenius error
+    (‖X Dᵀ‖_F² = tr(D·gram·Dᵀ)); it is only needed for quantization, so pruning
+    collects with ``with_gram=False`` (O(d_in) memory per projection).
+    """
+
+    __slots__ = ("col_sqnorm", "col_absmean", "gram", "n_tokens")
+
+    def __init__(self, col_sqnorm, col_absmean, gram, n_tokens):
+        self.col_sqnorm = col_sqnorm
+        self.col_absmean = col_absmean
+        self.gram = gram
+        self.n_tokens = n_tokens
+
+
+@torch.no_grad()
+def collect_calibration_stats(
+    model,
+    calibration_token_ids: List[List[int]],
+    device: str,
+    with_gram: bool = True,
+) -> Dict[str, "CalibStats"]:
+    """
+    Run the calibration sequences once and accumulate per-projection sufficient
+    statistics (see :class:`CalibStats`) instead of the full activation matrices.
+
+    with_gram  If True, also accumulate the d_in×d_in Gram matrix per projection
+               (needed by AWQ).  For Wanda / sensitivity probes pass False to keep
+               memory at O(d_in) per projection.
+
+    Statistics are accumulated on CPU in fp32; the per-batch Gram is formed on the
+    activation's device and moved to CPU, so peak GPU memory stays bounded.
+    """
+    accum: Dict[str, dict] = {}
+    hooks = []
+
+    for name, module in enumerate_eligible_projections(model):
+        accum[name] = {"sqsum": None, "abssum": None, "gram": None, "n": 0}
+
+        def make_hook(n):
+            def hook(mod, inp, out):
+                x = inp[0]
+                if x.dim() == 3:
+                    x = x.reshape(-1, x.shape[-1])
+                x = x.float()
+                a = accum[n]
+                sq = (x * x).sum(dim=0).cpu()
+                ab = x.abs().sum(dim=0).cpu()
+                a["sqsum"] = sq if a["sqsum"] is None else a["sqsum"] + sq
+                a["abssum"] = ab if a["abssum"] is None else a["abssum"] + ab
+                a["n"] += x.shape[0]
+                if with_gram:
+                    g = (x.t() @ x).cpu()
+                    a["gram"] = g if a["gram"] is None else a["gram"] + g
+            return hook
+
+        hooks.append(module.register_forward_hook(make_hook(name)))
+
+    model.eval()
+    for ids in calibration_token_ids:
+        t = torch.tensor([ids], dtype=torch.long, device=device)
+        model(t)
+
+    for h in hooks:
+        h.remove()
+
+    stats: Dict[str, CalibStats] = {}
+    for name, a in accum.items():
+        n = max(a["n"], 1)
+        stats[name] = CalibStats(
+            col_sqnorm=a["sqsum"].sqrt(),
+            col_absmean=a["abssum"] / n,
+            gram=a["gram"],
+            n_tokens=a["n"],
+        )
+    return stats
 
 
 def save_layer_output_error(

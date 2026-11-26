@@ -19,7 +19,12 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .baseline import enumerate_eligible_projections
+from .baseline import (
+    enumerate_eligible_projections,
+    exact_row_prune_mask,
+    collect_calibration_stats,
+    CalibStats,
+)
 
 
 # ── Activation collection ──────────────────────────────────────────────────────
@@ -38,6 +43,12 @@ def collect_calibration_inputs(
     dict mapping projection name → X tensor of shape (n_tokens, d_in), fp32, CPU.
     (Rows are individual token positions across all calibration sequences,
     concatenated; this matches the original Wanda implementation.)
+
+    WARNING — memory: at the PDF §1 calibration size (128×512 tokens) this stores
+    the full activation matrix for every projection and will OOM on Qwen2.5-1.5B
+    (>100 GB).  Prefer ``collect_calibration_stats`` (from .baseline), which
+    accumulates only the reductions the downstream code actually uses.  This
+    function is retained for tiny debugging/calibration sets only.
     """
     buffers: Dict[str, List[torch.Tensor]] = {}
     hooks = []
@@ -74,19 +85,24 @@ def collect_wanda_scores(
 ) -> Dict[str, torch.Tensor]:
     """
     Compute Wanda scores for all eligible projections given pre-collected
-    calibration inputs.
+    calibration statistics.
+
+    ``calibration_inputs[name]`` may be either a :class:`CalibStats` (preferred,
+    memory-efficient) or a raw X tensor of shape (n_tokens, d_in) — both yield the
+    identical column norm ||X_{:,j}||_2.
 
     Returns dict mapping name → score tensor (d_out, d_in), fp32, CPU.
     """
     scores = {}
     for name, module in enumerate_eligible_projections(model):
-        X = calibration_inputs[name]  # (n_tokens, d_in), fp32, CPU
+        calib = calibration_inputs[name]
+        if isinstance(calib, CalibStats):
+            col_norms = calib.col_sqnorm  # (d_in,) == sqrt(sum_t x^2) == ||X_{:,j}||_2
+        else:
+            col_norms = calib.norm(p=2, dim=0)  # raw X (n_tokens, d_in) fallback
         W = module.weight.data.float().cpu()  # (d_out, d_in)
 
-        # ||X_{j,:}||_2 for each column j (input feature dimension).
-        col_norms = X.norm(p=2, dim=0)  # (d_in,)
-
-        # S_ij = |W_ij| * col_norm_j
+        # S_ij = |W_ij| * ||X_{:,j}||_2
         scores[name] = W.abs() * col_norms.unsqueeze(0)  # (d_out, d_in)
     return scores
 
@@ -114,7 +130,10 @@ def wanda_prune(
 
     if calibration_inputs is None:
         assert calibration_token_ids is not None
-        calibration_inputs = collect_calibration_inputs(model, calibration_token_ids, device)
+        # Wanda only needs per-column norms, so skip the Gram matrix (with_gram=False).
+        calibration_inputs = collect_calibration_stats(
+            model, calibration_token_ids, device, with_gram=False
+        )
 
     scores_dict = collect_wanda_scores(model, calibration_inputs)
     result = {}
@@ -124,19 +143,7 @@ def wanda_prune(
         d_out, d_in = scores.shape
         n_zero = int(sparsity * d_in)
 
-        if n_zero > 0:
-            topk_vals, _ = torch.topk(scores, n_zero, dim=1, largest=False, sorted=False)
-            threshold = topk_vals.max(dim=1, keepdim=True).values
-            mask = scores > threshold
-            at_threshold = scores == threshold
-            needed_zeros = n_zero - (~mask).sum(dim=1, keepdim=True)
-            for i in range(d_out):
-                nz = needed_zeros[i].item()
-                if nz > 0:
-                    tie_cols = at_threshold[i].nonzero(as_tuple=False).squeeze(1)
-                    mask[i, tie_cols[:nz]] = False
-        else:
-            mask = torch.ones(d_out, d_in, dtype=torch.bool)
+        mask = exact_row_prune_mask(scores, n_zero)
 
         if inplace:
             W = module.weight.data

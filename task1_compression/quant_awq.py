@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .baseline import enumerate_eligible_projections, ELIGIBLE_SUFFIXES
+from .baseline import enumerate_eligible_projections, ELIGIBLE_SUFFIXES, CalibStats
 from .quant_uniform import group_quantize, group_dequantize, packed_bytes
 
 
@@ -51,7 +51,7 @@ def _per_channel_act_scale(X: torch.Tensor) -> torch.Tensor:
 
 def awq_scale_search(
     W: torch.Tensor,
-    X: torch.Tensor,
+    calib,
     bits: int,
     group_size: int = 128,
     exponents: List[float] = SCALE_EXPONENTS,
@@ -59,17 +59,40 @@ def awq_scale_search(
     """
     Search for the best per-channel scale via a small exponent grid.
 
-    W  (d_out, d_in) fp32 — weight matrix for one projection.
-    X  (n_tokens, d_in) fp32 — calibration input matrix for that projection.
+    W      (d_out, d_in) fp32 — weight matrix for one projection.
+    calib  :class:`CalibStats` for this projection (preferred, memory-efficient)
+           OR a raw X tensor of shape (n_tokens, d_in) fp32 (legacy fallback).
+
+    The reconstruction error is the mean squared calibration-output distortion
+        (1 / (N·d_out)) · || (Ŵ_q − W) Xᵀ ||_F²
+    With CalibStats this is computed exactly from the Gram matrix G = Σ_t x_t x_tᵀ
+    via the identity ‖D Xᵀ‖_F² = tr(D·G·Dᵀ), so the full activation matrix is
+    never materialised.  Given a raw X it falls back to the explicit X @ Wᵀ form;
+    both paths yield the same number.
 
     Returns
     -------
     best_scale  (d_in,) fp32 — per-channel weight scale factors α
     best_exp    float        — winning exponent
-    best_err    float        — Frobenius reconstruction error at best_exp
+    best_err    float        — reconstruction error at best_exp
     """
-    act_scale = _per_channel_act_scale(X)  # (d_in,)
-    ref_out = X @ W.T  # (n_tokens, d_out) — reference output
+    d_out = W.shape[0]
+    if isinstance(calib, CalibStats):
+        act_scale = calib.col_absmean.clamp(min=1e-6)  # (d_in,)
+        gram = calib.gram
+        n_tokens = calib.n_tokens
+        if gram is None:
+            raise ValueError(
+                "awq_scale_search needs the Gram matrix; collect stats with "
+                "collect_calibration_stats(..., with_gram=True)."
+            )
+        X = None
+    else:
+        X = calib
+        act_scale = _per_channel_act_scale(X)  # (d_in,)
+        gram = None
+        n_tokens = X.shape[0]
+        ref_out = X @ W.T  # (n_tokens, d_out)
 
     best_err = float("inf")
     best_scale = torch.ones(W.shape[1])
@@ -90,9 +113,13 @@ def awq_scale_search(
         inv_alpha = 1.0 / alpha
         W_q_hat = W_scaled_hat * inv_alpha.unsqueeze(0)
 
-        # Reconstruction error: || W_q_hat @ X^T - W @ X^T ||_F
-        recon_out = X @ W_q_hat.T
-        err = (recon_out - ref_out).pow(2).mean().item()
+        # Mean squared calibration-output distortion.
+        if gram is not None:
+            D = W_q_hat - W  # (d_out, d_in)
+            err = ((D @ gram) * D).sum().item() / (n_tokens * d_out)
+        else:
+            recon_out = X @ W_q_hat.T
+            err = (recon_out - ref_out).pow(2).mean().item()
 
         if err < best_err:
             best_err = err
@@ -156,11 +183,11 @@ def apply_awq_quantization(
     fold_ops = {}  # accumulate fold operations before modifying any module
 
     for name, module in enumerate_eligible_projections(model):
-        X = calibration_inputs[name].float()  # (n_tokens, d_in)
+        calib = calibration_inputs[name]  # CalibStats (preferred) or raw X tensor
         W = module.weight.data.float().cpu()
         d_out, d_in = W.shape
 
-        best_scale, best_exp, best_err = awq_scale_search(W, X, bits, group_size, exponents)
+        best_scale, best_exp, best_err = awq_scale_search(W, calib, bits, group_size, exponents)
 
         # Rescale and quantise.
         W_scaled = W * best_scale.unsqueeze(0)

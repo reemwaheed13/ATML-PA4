@@ -33,3 +33,7 @@ venv/
 .venv/
 .DS_Store
 Thumbs.db
+
+# Assignment spec PDF — course material, not part of the submitted code.
+# (Kept locally; must not live in the public submission repo.)
+ATML_PA4.pdf

@@ -28,7 +28,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from .baseline import enumerate_eligible_projections
+from .baseline import enumerate_eligible_projections, CalibStats
 from .quant_awq import awq_scale_search, apply_awq_quantization
 from .quant_uniform import group_quantize, group_dequantize, packed_bytes
 
@@ -38,27 +38,30 @@ ALLOWED_BITS = [2, 3, 4, 8]
 
 def projection_sensitivity(
     module: torch.nn.Linear,
-    X: torch.Tensor,
+    calib,
 ) -> float:
     """
-    Per-projection sensitivity: variance of the per-channel activation norm
-    across calibration tokens (higher = more sensitive to quantisation).
+    Per-projection sensitivity: variance of the per-channel mean |activation|
+    across input channels (higher = more sensitive to quantisation).
 
-    Uses calibration inputs only.
+    ``calib`` may be a :class:`CalibStats` (preferred) or a raw X tensor; both
+    give the identical per-channel mean |activation|.  Uses calibration inputs only.
     """
-    col_norms = X.float().abs().mean(dim=0)  # (d_in,)
+    if isinstance(calib, CalibStats):
+        col_norms = calib.col_absmean  # (d_in,) == mean_t |x_t|
+    else:
+        col_norms = calib.float().abs().mean(dim=0)  # (d_in,)
     return col_norms.var().item()
 
 
 def measure_all_sensitivities(
     model,
-    calibration_inputs: Dict[str, torch.Tensor],
+    calibration_inputs: Dict[str, "CalibStats"],
 ) -> Dict[str, float]:
     """Return dict name → sensitivity float for all eligible projections."""
     sens = {}
     for name, module in enumerate_eligible_projections(model):
-        X = calibration_inputs[name]
-        sens[name] = projection_sensitivity(module, X)
+        sens[name] = projection_sensitivity(module, calibration_inputs[name])
     return sens
 
 
@@ -133,12 +136,12 @@ def mixed_precision_quantize(
 
     for name, module in enumerate_eligible_projections(model):
         bits = bit_assignment[name]
-        X = calibration_inputs[name].float()
+        calib = calibration_inputs[name]  # CalibStats (preferred) or raw X tensor
         W = module.weight.data.float().cpu()
         d_out, d_in = W.shape
 
         from .quant_awq import awq_scale_search, _find_predecessor, SCALE_EXPONENTS
-        best_scale, best_exp, best_err = awq_scale_search(W, X, bits, group_size, SCALE_EXPONENTS)
+        best_scale, best_exp, best_err = awq_scale_search(W, calib, bits, group_size, SCALE_EXPONENTS)
 
         W_scaled = W * best_scale.unsqueeze(0)
         q_int, scales, zeros = group_quantize(W_scaled, bits, group_size)

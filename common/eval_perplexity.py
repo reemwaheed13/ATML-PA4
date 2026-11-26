@@ -110,12 +110,25 @@ def _process_batch(batch_recs, model, device, dtype, per_window):
 
     for b, rec in enumerate(batch_recs):
         token_ids = rec["token_ids"]
+        L = len(token_ids)
         # Determine which positions are scored.
         if "score_target_offsets" in rec:
             offsets = rec["score_target_offsets"]
         else:
             # Default: exclude the first token (position 0).
-            offsets = list(range(1, len(token_ids)))
+            offsets = list(range(1, L))
+
+        # Guard the offset convention: a scored target at window position t is
+        # predicted from the logits at position t-1, so t==0 would silently read
+        # log_probs[..., -1] (the last position) and t>=L would run off the end.
+        # Both would corrupt the pooled NLL without raising, so reject them here.
+        # Per PDF §1 the first token of each window is context-only and unscored.
+        for t in offsets:
+            if t < 1 or t >= L:
+                raise ValueError(
+                    f"score_target_offset {t} out of range for window of length {L}; "
+                    "offsets must lie in [1, L-1] (position 0 is context-only)."
+                )
 
         nll_sum = 0.0
         for t in offsets:

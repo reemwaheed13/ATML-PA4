@@ -16,7 +16,7 @@ from typing import Dict, List
 
 import torch
 
-from .baseline import enumerate_eligible_projections
+from .baseline import enumerate_eligible_projections, exact_row_prune_mask
 
 
 def magnitude_prune(
@@ -48,23 +48,8 @@ def magnitude_prune(
 
         scores = W.float().abs()  # (d_out, d_in)
 
-        # Per-row: find the n_zero smallest-score column indices.
-        if n_zero > 0:
-            topk_vals, _ = torch.topk(scores, n_zero, dim=1, largest=False, sorted=False)
-            threshold = topk_vals.max(dim=1, keepdim=True).values
-            mask = scores > threshold  # keep positions above threshold
-            # Handle ties: ensure exactly n_zero zeros per row.
-            # Where score == threshold, we need to selectively zero some.
-            at_threshold = scores == threshold
-            needed_zeros = n_zero - (~mask).sum(dim=1, keepdim=True)  # already-zero count
-            # Greedily zero additional ties from left.
-            for i in range(d_out):
-                if needed_zeros[i].item() > 0:
-                    tie_cols = at_threshold[i].nonzero(as_tuple=False).squeeze(1)
-                    zero_cols = tie_cols[: needed_zeros[i].item()]
-                    mask[i, zero_cols] = False
-        else:
-            mask = torch.ones(d_out, d_in, dtype=torch.bool, device=W.device)
+        # Per-row: zero exactly the n_zero smallest-score columns.
+        mask = exact_row_prune_mask(scores, n_zero)
 
         if inplace:
             module.weight.data *= mask.to(W.dtype)

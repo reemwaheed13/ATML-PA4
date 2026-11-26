@@ -28,7 +28,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from .baseline import enumerate_eligible_projections, ELIGIBLE_SUFFIXES
+from .baseline import enumerate_eligible_projections, ELIGIBLE_SUFFIXES, exact_row_prune_mask
 from .prune_wanda import wanda_prune
 
 
@@ -210,19 +210,7 @@ def nonuniform_prune(
             d_out, d_in = scores.shape
             n_zero = int(s * d_in)
 
-            if n_zero > 0:
-                topk_vals, _ = torch.topk(scores, n_zero, dim=1, largest=False)
-                threshold = topk_vals.max(dim=1, keepdim=True).values
-                mask = scores > threshold
-                at_threshold = scores == threshold
-                needed_zeros = n_zero - (~mask).sum(dim=1, keepdim=True)
-                for i in range(d_out):
-                    nz = needed_zeros[i].item()
-                    if nz > 0:
-                        tie_cols = at_threshold[i].nonzero(as_tuple=False).squeeze(1)
-                        mask[i, tie_cols[:nz]] = False
-            else:
-                mask = torch.ones(d_out, d_in, dtype=torch.bool)
+            mask = exact_row_prune_mask(scores, n_zero)
 
             W = module.weight.data
             module.weight.data = (W.float().cpu() * mask.float()).to(W.dtype).to(W.device)
