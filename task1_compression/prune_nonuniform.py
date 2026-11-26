@@ -1,220 +1,324 @@
 """
-P3: Nonuniform Wanda pruning with sensitivity-guided allocation.
+P3: nonuniform Wanda pruning with a calibration-measured, block-level allocation.
 
-Design (must be justified with calibration evidence in the report):
+Allocation unit
+    One Transformer block (28 in Qwen2.5-1.5B).  All 7 eligible projections of block
+    l share one target sparsity s_l.
 
-Sensitivity measure chosen here: layer-output reconstruction error on calibration
-activations when each block is pruned uniformly at a probe sparsity (0.50).  This
-is a lightweight proxy for block importance — inspired by ShortGPT / Molchanov et
-al.  Blocks with high reconstruction error receive lower sparsity (more weights
-kept); blocks with low reconstruction error can tolerate higher sparsity.
+Sensitivity (calibration set only, 128 C4 sequences)
+    For each block l and each of its projections p, build the P2 Wanda mask at the
+    probe sparsity s_probe (same score |W_ij| * ||X_:,j||_2, same per-row
+    exact_row_prune_mask, same n_zero = int(s_probe * d_in)), set D_p = W_p*mask - W_p
+    and measure the calibration output error through the projection's Gram matrix
+    G_p = sum_t x_t x_t^T (inputs from the UNMODIFIED FP16 model):
+        err(D) = tr(D G D^T) = ||D X^T||_F^2
+        sensitivity_l = sum_p tr(D_p G_p D_p^T) / sum_p tr(W_p G_p W_p^T)
+    s_probe = the target global sparsity S (0.50 or 0.75).
 
-Allocation rule (inverse-proportional with clipping):
-  s_l = clip(s_global / sensitivity_l_normalized, s_min, s_max)
-  then rescale all s_l so that total zeroed weights == target.
+Allocation rule
+    r_l  = rank-normalised sensitivity in [0, 1] (0 = least sensitive; ties averaged)
+    s_l  = S + lam * (1 - 2 r_l)                 (robust blocks are pruned more)
+    s_l <- clip(s_l + c, 0.10, 0.85), with a common offset c found by bisection so
+           that sum_l s_l N_l = round(S * N_eligible)
+    integerise: per projection a total zero count (largest remainder, so the GLOBAL
+    count equals round(S * N_eligible) exactly and each projection stays inside
+    [0.10, 0.85]); within a projection the per-row counts differ by at most 1.
 
-Permitted sparsity range per allocation unit: [0.10, 0.85] (PDF §1 step 4).
-Allocation unit: individual Transformer block (all 7 projections share one s_l).
+Hyperparameter (development set only, 32 C4 sequences)
+    lam in LAMBDA_GRID, chosen by lowest development PPL (all tokens but position 0).
+    WikiText-2, C4 validation and HellaSwag are never used to choose anything.
 
-IMPORTANT: s_l is chosen using ONLY the 32-sequence calibration DEVELOPMENT
-manifest, NOT the final test splits.  This module enforces that by requiring
-the caller to pass dev-set inputs.
+Rejected alternative
+    outlier_proxy_sensitivity(): OWL-style weight-only ratio max|W| / mean|W| per
+    block.  It ignores the activations and the mask actually applied, so it does not
+    measure what pruning does to the block's outputs; recorded for comparison only.
 """
 
-import json
 import math
-from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from .baseline import enumerate_eligible_projections, ELIGIBLE_SUFFIXES, exact_row_prune_mask
-from .prune_wanda import wanda_prune
+from .baseline import CalibStats, enumerate_eligible_projections, exact_row_prune_mask
 
 
 S_MIN = 0.10
 S_MAX = 0.85
+LAMBDA_GRID = [0.02, 0.05, 0.08, 0.12, 0.16]
 
 
-def _get_block_modules(model):
-    """Return ordered list of Transformer blocks (model.model.layers)."""
-    return list(model.model.layers)
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _dev(device: Optional[str]) -> str:
+    if device is not None:
+        return device
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def measure_block_sensitivity(
-    model,
-    dev_calibration_inputs: Dict[str, torch.Tensor],
-    probe_sparsity: float = 0.50,
-    device: str = "cuda:0",
-) -> Dict[int, float]:
+def block_index(name: str) -> int:
+    return int(name.split(".layers.")[1].split(".")[0])
+
+
+def gram_error(D: torch.Tensor, G: torch.Tensor) -> float:
+    """tr(D G D^T) == ||D X^T||_F^2 when G = X^T X."""
+    return float(((D @ G) * D).sum().item())
+
+
+def wanda_scores_for(W: torch.Tensor, stats: CalibStats) -> torch.Tensor:
+    """|W_ij| * ||X_:,j||_2 (fp32, on W's device) -- identical to P2."""
+    return W.abs() * stats.col_sqnorm.to(W.device, torch.float32).unsqueeze(0)
+
+
+def p2_zero_count(proj_shapes: Dict[str, Tuple[int, int]], S: float) -> int:
+    """Eligible zeros produced by P2 (uniform Wanda) at sparsity S."""
+    return sum(int(S * d_in) * d_out for d_out, d_in in proj_shapes.values())
+
+
+def projection_shapes(model) -> Dict[str, Tuple[int, int]]:
+    return {n: tuple(m.weight.shape) for n, m in enumerate_eligible_projections(model)}
+
+
+def _spearman(a: Sequence[float], b: Sequence[float]) -> float:
+    ra, rb = torch.tensor(_avg_ranks(a)), torch.tensor(_avg_ranks(b))
+    ra, rb = ra - ra.mean(), rb - rb.mean()
+    den = (ra.norm() * rb.norm()).item()
+    return float((ra * rb).sum().item() / den) if den > 0 else float("nan")
+
+
+def _avg_ranks(x: Sequence[float]) -> List[float]:
+    """0-based ranks with ties averaged."""
+    order = sorted(range(len(x)), key=lambda i: x[i])
+    ranks = [0.0] * len(x)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and x[order[j + 1]] == x[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = (i + j) / 2.0
+        i = j + 1
+    return ranks
+
+
+# ── sensitivity ───────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def block_sensitivity(model, stats: Dict[str, CalibStats], s_probe: float,
+                      device: Optional[str] = None) -> Dict[str, dict]:
     """
-    Probe each block at `probe_sparsity` using Wanda scores and measure the
-    mean squared output error on dev calibration inputs.
-
-    Returns dict: block_idx → sensitivity_score (float, higher = more sensitive).
-    Uses ONLY dev (32-sequence) inputs — never test data.
+    Per-block Gram-based relative output error of the P2 Wanda mask at s_probe.
+    Returns {"per_block": {l: sens}, "per_projection": {name: {err, ref, rel}}}.
+    The model is not modified.
     """
-    import copy
-    model.eval()
-    blocks = _get_block_modules(model)
-    n_blocks = len(blocks)
-    sensitivities = {}
-
-    for layer_idx in range(n_blocks):
-        # Collect reference outputs for this block.
-        ref_outputs = []
-        hooks = []
-
-        def make_ref_hook(buf):
-            def h(mod, inp, out):
-                buf.append(out[0].detach().float().cpu() if isinstance(out, tuple) else out.detach().float().cpu())
-            return h
-
-        hooks.append(blocks[layer_idx].register_forward_hook(make_ref_hook(ref_outputs)))
-
-        with torch.no_grad():
-            for name, X_cpu in dev_calibration_inputs.items():
-                # We only need one pass to collect reference activations.
-                break
-            # Actually we need to run the full model on dev sequences.
-            # For efficiency, run a single representative dev sequence.
-            # Caller must pass raw token IDs separately; here we approximate by
-            # using a placeholder — the actual implementation in the notebook
-            # will pass proper dev token ids.
-        for h in hooks:
-            h.remove()
-
-        # Prune this block's projections.
-        pruned_model = copy.deepcopy(model)
-        pruned_blocks = _get_block_modules(pruned_model)
-        # Collect only projections belonging to this layer.
-        layer_prefix = f"model.layers.{layer_idx}."
-        layer_proj_names = [
-            (n, m) for n, m in enumerate_eligible_projections(pruned_model)
-            if n.startswith(layer_prefix)
-        ]
-        # Apply Wanda scores to just this layer.
-        for pname, pmod in layer_proj_names:
-            suffix = next(s for s in ELIGIBLE_SUFFIXES if pname.endswith(s))
-            # Look up pre-computed Wanda scores.
-            if pname in dev_calibration_inputs:
-                pass  # dev_calibration_inputs here holds X matrices, not scores
-
-        # Sensitivity is estimated as the Frobenius norm of the weight score
-        # variation (outlier-based proxy similar to OWL):
-        # s_i = max(|W_ij|) / mean(|W_ij|) aggregated over the block's projections.
-        score = 0.0
-        n_proj = 0
-        for pname, pmod in enumerate_eligible_projections(model):
-            if not pname.startswith(layer_prefix):
-                continue
-            W = pmod.weight.data.float()
-            outlier_ratio = W.abs().max().item() / (W.abs().mean().item() + 1e-8)
-            score += outlier_ratio
-            n_proj += 1
-        sensitivities[layer_idx] = score / n_proj if n_proj > 0 else 1.0
-
-    return sensitivities
+    dev = _dev(device)
+    num: Dict[int, float] = {}
+    den: Dict[int, float] = {}
+    per_proj = {}
+    for name, mod in enumerate_eligible_projections(model):
+        s = stats[name]
+        if s.gram is None:
+            raise ValueError("block_sensitivity needs with_gram=True calibration stats")
+        W = mod.weight.data.to(dev, torch.float32)
+        G = s.gram.to(dev, torch.float32)
+        mask = exact_row_prune_mask(wanda_scores_for(W, s), int(s_probe * W.shape[1]))
+        D = W * mask - W
+        e, r = gram_error(D, G), gram_error(W, G)
+        l = block_index(name)
+        num[l] = num.get(l, 0.0) + e
+        den[l] = den.get(l, 0.0) + r
+        per_proj[name] = {"err": e, "ref": r, "rel": e / r if r > 0 else 0.0}
+        del W, G, mask, D
+    if dev.startswith("cuda"):
+        torch.cuda.empty_cache()
+    per_block = {l: (num[l] / den[l] if den[l] > 0 else 0.0) for l in sorted(num)}
+    return {"per_block": per_block, "per_projection": per_proj, "s_probe": s_probe,
+            "definition": "sum_p tr(D_p G_p D_p^T) / sum_p tr(W_p G_p W_p^T), D_p = W_p*mask_p - W_p, "
+                          "mask_p = P2 Wanda mask at s_probe, G_p from the unmodified FP16 model"}
 
 
-def allocate_sparsities(
-    sensitivities: Dict[int, float],
-    target_global_sparsity: float,
-    model,
-    s_min: float = S_MIN,
-    s_max: float = S_MAX,
-) -> Dict[int, float]:
+@torch.no_grad()
+def outlier_proxy_sensitivity(model) -> Dict[int, float]:
+    """REJECTED alternative (OWL-style, weight only): mean over the block's
+    projections of max|W| / mean|W|.  Recorded for comparison, never used."""
+    acc: Dict[int, List[float]] = {}
+    for name, mod in enumerate_eligible_projections(model):
+        W = mod.weight.data.float().abs()
+        acc.setdefault(block_index(name), []).append(W.max().item() / (W.mean().item() + 1e-8))
+    return {l: sum(v) / len(v) for l, v in sorted(acc.items())}
+
+
+# ── allocation ────────────────────────────────────────────────────────────────
+
+def allocate(sens: Dict[int, float], S: float, lam: float,
+             proj_shapes: Dict[str, Tuple[int, int]],
+             s_min: float = S_MIN, s_max: float = S_MAX,
+             target_zeros: Optional[int] = None) -> dict:
     """
-    Convert block sensitivities into per-block sparsities.
+    sens         block -> sensitivity (higher = more sensitive)
+    proj_shapes  projection name -> (d_out, d_in), every eligible projection
 
-    Allocation rule: inverse-proportional, then clip, then rescale to match
-    the total eligible-weight budget exactly (up to integer-weight rounding).
-
-    Returns dict: block_idx → target_sparsity_for_this_block.
+    Returns {"s_block", "offset", "proj_zeros", "row_counts", "target_zeros",
+             "achieved_zeros", "rank", "s_raw"}; row_counts[name] = (base, n_extra):
+    n_extra rows get base+1 zeros, the rest base.
     """
-    n_blocks = len(sensitivities)
-    block_idxs = sorted(sensitivities.keys())
+    blocks = sorted(sens)
+    L = len(blocks)
+    N_l = {l: 0 for l in blocks}
+    for n, (o, i) in proj_shapes.items():
+        N_l[block_index(n)] += o * i
+    N = sum(N_l.values())
+    if target_zeros is None:
+        target_zeros = int(round(S * N))
+    if not (s_min * N <= target_zeros <= s_max * N):
+        raise ValueError("target sparsity outside the permitted [s_min, s_max] range")
 
-    # Count eligible weights per block.
-    block_n_weights = {}
-    for idx in block_idxs:
-        prefix = f"model.layers.{idx}."
-        n = sum(
-            m.weight.numel()
-            for name, m in enumerate_eligible_projections(model)
-            if name.startswith(prefix)
-        )
-        block_n_weights[idx] = n
+    ranks = _avg_ranks([sens[l] for l in blocks])
+    r = {l: (ranks[k] / (L - 1) if L > 1 else 0.5) for k, l in enumerate(blocks)}
+    s_raw = {l: S + lam * (1.0 - 2.0 * r[l]) for l in blocks}
 
-    total_eligible = sum(block_n_weights.values())
-    target_total_zeros = int(target_global_sparsity * total_eligible)
+    def total(c):
+        return sum(min(s_max, max(s_min, s_raw[l] + c)) * N_l[l] for l in blocks)
 
-    # Inverse-proportional initial allocation.
-    max_sens = max(sensitivities.values()) + 1e-8
-    raw_sparsities = {
-        idx: target_global_sparsity * (max_sens / (sensitivities[idx] + 1e-8))
-        for idx in block_idxs
-    }
+    lo, hi = -1.0, 1.0  # total(lo) = s_min*N <= target <= s_max*N = total(hi)
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if total(mid) < target_zeros:
+            lo = mid
+        else:
+            hi = mid
+    c = 0.5 * (lo + hi)
+    s_block = {l: min(s_max, max(s_min, s_raw[l] + c)) for l in blocks}
 
-    # Clip to [s_min, s_max].
-    clipped = {idx: min(s_max, max(s_min, raw_sparsities[idx])) for idx in block_idxs}
+    # Integerise per projection with largest remainder, inside [s_min, s_max].
+    names = list(proj_shapes)
+    want, fl, lo_b, hi_b = {}, {}, {}, {}
+    for n in names:
+        o, i = proj_shapes[n]
+        sz = o * i
+        want[n] = s_block[block_index(n)] * sz
+        lo_b[n] = math.ceil(s_min * sz)
+        hi_b[n] = math.floor(s_max * sz)
+        fl[n] = min(hi_b[n], max(lo_b[n], math.floor(want[n])))
+    deficit = target_zeros - sum(fl.values())
+    if deficit > 0:
+        cand = sorted((n for n in names if fl[n] < hi_b[n]),
+                      key=lambda n: (-(want[n] - fl[n]), names.index(n)))
+        while deficit > 0:
+            if not cand:
+                raise RuntimeError("cannot integerise allocation within bounds")
+            progressed = False
+            for n in cand:
+                if deficit == 0:
+                    break
+                if fl[n] < hi_b[n]:
+                    fl[n] += 1
+                    deficit -= 1
+                    progressed = True
+            if not progressed:
+                raise RuntimeError("cannot integerise allocation within bounds")
+    elif deficit < 0:
+        cand = sorted((n for n in names if fl[n] > lo_b[n]),
+                      key=lambda n: ((want[n] - fl[n]), names.index(n)))
+        while deficit < 0:
+            progressed = False
+            for n in cand:
+                if deficit == 0:
+                    break
+                if fl[n] > lo_b[n]:
+                    fl[n] -= 1
+                    deficit += 1
+                    progressed = True
+            if not progressed:
+                raise RuntimeError("cannot integerise allocation within bounds")
 
-    # Rescale so that total zeroed weights hits target exactly.
-    # Iterative proportional rescaling.
-    for _ in range(20):
-        current_zeros = sum(
-            clipped[idx] * block_n_weights[idx] for idx in block_idxs
-        )
-        if abs(current_zeros - target_total_zeros) < 1:
-            break
-        ratio = target_total_zeros / (current_zeros + 1e-8)
-        for idx in block_idxs:
-            clipped[idx] = min(s_max, max(s_min, clipped[idx] * ratio))
-
-    return clipped
+    row_counts = {}
+    for n in names:
+        o, _ = proj_shapes[n]
+        row_counts[n] = (fl[n] // o, fl[n] % o)
+    achieved = sum(fl.values())
+    assert achieved == target_zeros, (achieved, target_zeros)
+    return {"s_block": s_block, "s_raw": s_raw, "rank": r, "offset": c, "lam": lam, "S": S,
+            "proj_zeros": fl, "row_counts": row_counts, "target_zeros": target_zeros,
+            "achieved_zeros": achieved, "n_eligible": N}
 
 
-def nonuniform_prune(
-    model,
-    target_global_sparsity: float,
-    sensitivities: Dict[int, float],
-    calibration_inputs: Dict[str, torch.Tensor],
-    device: str = "cuda:0",
-    s_min: float = S_MIN,
-    s_max: float = S_MAX,
-) -> Tuple[Dict, Dict[int, float]]:
+def variable_row_mask(scores: torch.Tensor, base: int, n_extra: int) -> torch.Tensor:
+    """Keep-mask with `base` zeros in every row and one more zero in `n_extra` rows:
+    the rows whose (base+1)-th smallest score is smallest.  Built from the same
+    exact_row_prune_mask as P2."""
+    if n_extra == 0:
+        return exact_row_prune_mask(scores, base)
+    kth = torch.kthvalue(scores, base + 1, dim=1).values
+    extra_rows = torch.topk(kth, n_extra, largest=False, sorted=False).indices
+    is_extra = torch.zeros(scores.shape[0], dtype=torch.bool, device=scores.device)
+    is_extra[extra_rows] = True
+    mask = torch.empty_like(scores, dtype=torch.bool)
+    mask[~is_extra] = exact_row_prune_mask(scores[~is_extra], base)
+    mask[is_extra] = exact_row_prune_mask(scores[is_extra], base + 1)
+    return mask
+
+
+@torch.no_grad()
+def apply_allocation(model, alloc: dict, stats: Dict[str, CalibStats],
+                     originals: Optional[Dict[str, torch.Tensor]] = None,
+                     device: Optional[str] = None, keep_masks: bool = True) -> Dict[str, dict]:
+    """Prune every eligible projection to its allocated counts.  If `originals`
+    (CPU FP16 copies) is given, weights are first restored from it, so repeated calls
+    always start from the unmodified FP16 weights.  keep_masks=False skips copying
+    the boolean masks to CPU (used during the development grid)."""
+    dev = _dev(device)
+    out = {}
+    for name, mod in enumerate_eligible_projections(model):
+        if originals is not None:
+            mod.weight.data.copy_(originals[name].to(mod.weight.device))
+        W = mod.weight.data.to(dev, torch.float32)
+        base, extra = alloc["row_counts"][name]
+        mask = variable_row_mask(wanda_scores_for(W, stats[name]), base, extra)
+        mod.weight.data = (W * mask).to(mod.weight.dtype).to(mod.weight.device)
+        zeros = int((~mask).sum().item())
+        assert zeros == alloc["proj_zeros"][name], (name, zeros, alloc["proj_zeros"][name])
+        out[name] = {"mask": mask.cpu() if keep_masks else None, "zeros": zeros, "achieved_sparsity": zeros / mask.numel(),
+                     "block_sparsity_target": alloc["s_block"][block_index(name)]}
+        del W
+    if dev.startswith("cuda"):
+        torch.cuda.empty_cache()
+    return out
+
+
+# ── development-set selection ────────────────────────────────────────────────
+
+@torch.no_grad()
+def select_lambda(model, stats: Dict[str, CalibStats], S: float, dev_ids: List[List[int]],
+                  originals: Dict[str, torch.Tensor], device: Optional[str] = None,
+                  grid: Sequence[float] = LAMBDA_GRID, ppl_dtype=torch.float16,
+                  batch_size: int = 1, sens: Optional[dict] = None) -> dict:
     """
-    Apply nonuniform Wanda pruning.
-
-    Returns (masks_dict, per_block_sparsities).
-    masks_dict matches the structure returned by wanda_prune().
+    For each lam in grid: allocate, apply masks to the FP16 weights restored from
+    the CPU copy `originals`, and score development PPL.  Picks the lowest dev PPL
+    (ties -> smaller lam).  The model is left pruned at the chosen lam.
     """
-    block_sparsities = allocate_sparsities(sensitivities, target_global_sparsity, model, s_min, s_max)
-    blocks = _get_block_modules(model)
-    n_blocks = len(blocks)
-    all_masks = {}
+    from common.eval_perplexity import perplexity_on_token_ids
 
-    model.eval()
-    # Pre-compute Wanda scores using calibration_inputs.
-    from .prune_wanda import collect_wanda_scores
-    scores_dict = collect_wanda_scores(model, calibration_inputs)
+    dev = _dev(device)
+    shapes = projection_shapes(model)
+    if sens is None:
+        sens = block_sensitivity(model, stats, S, dev)
+    target = int(round(S * sum(o * i for o, i in shapes.values())))
+    p2 = p2_zero_count(shapes, S)
+    assert target == p2, f"round(S*N_eligible)={target} != P2 zero count {p2}"
 
-    for layer_idx in range(n_blocks):
-        s = block_sparsities[layer_idx]
-        prefix = f"model.layers.{layer_idx}."
-
-        for name, module in enumerate_eligible_projections(model):
-            if not name.startswith(prefix):
-                continue
-            scores = scores_dict[name]
-            d_out, d_in = scores.shape
-            n_zero = int(s * d_in)
-
-            mask = exact_row_prune_mask(scores, n_zero)
-
-            W = module.weight.data
-            module.weight.data = (W.float().cpu() * mask.float()).to(W.dtype).to(W.device)
-            achieved = 1.0 - mask.float().mean().item()
-            all_masks[name] = {"mask": mask.cpu(), "achieved_sparsity": achieved, "block_sparsity": s}
-
-    return all_masks, block_sparsities
+    points = []
+    for lam in grid:
+        alloc = allocate(sens["per_block"], S, lam, shapes)
+        apply_allocation(model, alloc, stats, originals, dev, keep_masks=False)
+        r = perplexity_on_token_ids(model, dev_ids, dev, dtype=ppl_dtype, batch_size=batch_size)
+        points.append({"lam": lam, "dev_ppl": r["ppl"], "dev_mean_nll": r["mean_nll"], "dev_N": r["N"],
+                       "s_block": {str(l): v for l, v in alloc["s_block"].items()},
+                       "offset": alloc["offset"], "achieved_zeros": alloc["achieved_zeros"]})
+    best = min(points, key=lambda p: (p["dev_ppl"], p["lam"]))
+    alloc = allocate(sens["per_block"], S, best["lam"], shapes)
+    masks = apply_allocation(model, alloc, stats, originals, dev)
+    zeros = sum(v["zeros"] for v in masks.values())
+    assert zeros == p2, f"P3 zeros {zeros} != P2 zeros {p2}"
+    return {"lam": best["lam"], "grid": points, "alloc": alloc, "masks": masks, "sens": sens,
+            "p2_zero_count": p2, "achieved_zeros": zeros}

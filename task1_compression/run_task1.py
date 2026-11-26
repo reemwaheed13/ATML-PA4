@@ -10,11 +10,16 @@ Conditions (PDF §1 steps 1-8, 18 total):
     fp16                          unchanged FP16 baseline
     p1_s25 / p1_s50 / p1_s75      magnitude pruning
     p2_s25 / p2_s50 / p2_s75      Wanda pruning
-    p3_s50 / p3_s75               nonuniform Wanda (DRAFT design, needs --allow-draft-p3q3)
+    p3_s50 / p3_s75               nonuniform Wanda (block-level Gram sensitivity, lambda chosen on dev)
     p2_24                         2:4 Wanda structured diagnostic at 50%
     q1_int8 / q1_int4 / q1_int3   uniform group-wise asymmetric PTQ (group 128)
     q2_int8 / q2_int4 / q2_int3   AWQ-style PTQ (serialized FP16 compensating scales)
-    q3_int4 / q3_int3             mixed precision at the Q2 INT4 / INT3 packed budgets (DRAFT)
+    q3_int4 / q3_int3             mixed precision at the Q2 INT4 / INT3 total-byte budgets (b_min chosen on dev)
+
+Condition groups for --conditions: 'overnight' (the 14 non-adaptive conditions),
+'adaptive' (p3_s50, p3_s75, q3_int4, q3_int3) and 'all' (18).  P3/Q3 hyperparameters
+are selected on the 32 C4 development sequences only; that selection time is part of
+their compression time.
 
 Full 2,000-example HellaSwag: fp16, the three 50%-sparsity pruning methods
 (p1_s50, p2_s50, p3_s50) and all INT4/INT3 quantization variants; every other
@@ -71,6 +76,7 @@ GROUP_SIZE = 128
 DEFAULT_DATA_ROOT = "/content/drive/MyDrive/atml-pa4-datasets/data/public_locked"
 DEFAULT_RESULTS_ROOT = "/content/drive/MyDrive/atml_pa4_results/task1"
 DEFAULT_CALIB_CACHE = "/content/calib_stats.pt"
+DEFAULT_Q3_TABLE_CACHE = "/content/q3_table.pt"
 DEFAULT_REVISIONS = str(_REPO_ROOT / "data" / "local_source_revisions.json")
 
 FILES = {
@@ -91,9 +97,9 @@ N_QUALITATIVE = 8
 
 # ── Condition registry ────────────────────────────────────────────────────────
 
-def _c(family, method, sparsity=None, bits=None, hs_full=False, draft=False):
+def _c(family, method, sparsity=None, bits=None, hs_full=False, adaptive=False):
     return {"family": family, "method": method, "sparsity": sparsity, "bits": bits,
-            "hs_full": hs_full, "draft": draft}
+            "hs_full": hs_full, "adaptive": adaptive}
 
 
 CONDITIONS: Dict[str, dict] = {
@@ -104,8 +110,8 @@ CONDITIONS: Dict[str, dict] = {
     "p2_s25": _c("pruning", "wanda", sparsity=0.25),
     "p2_s50": _c("pruning", "wanda", sparsity=0.50, hs_full=True),
     "p2_s75": _c("pruning", "wanda", sparsity=0.75),
-    "p3_s50": _c("pruning", "nonuniform_wanda", sparsity=0.50, hs_full=True, draft=True),
-    "p3_s75": _c("pruning", "nonuniform_wanda", sparsity=0.75, draft=True),
+    "p3_s50": _c("pruning", "nonuniform_wanda", sparsity=0.50, hs_full=True, adaptive=True),
+    "p3_s75": _c("pruning", "nonuniform_wanda", sparsity=0.75, adaptive=True),
     "p2_24": _c("pruning", "wanda_2of4", sparsity=0.50),
     "q1_int8": _c("quantization", "uniform", bits=8),
     "q1_int4": _c("quantization", "uniform", bits=4, hs_full=True),
@@ -113,28 +119,25 @@ CONDITIONS: Dict[str, dict] = {
     "q2_int8": _c("quantization", "awq", bits=8),
     "q2_int4": _c("quantization", "awq", bits=4, hs_full=True),
     "q2_int3": _c("quantization", "awq", bits=3, hs_full=True),
-    "q3_int4": _c("quantization", "mixed", bits=4, hs_full=True, draft=True),
-    "q3_int3": _c("quantization", "mixed", bits=3, hs_full=True, draft=True),
+    "q3_int4": _c("quantization", "mixed", bits=4, hs_full=True, adaptive=True),
+    "q3_int3": _c("quantization", "mixed", bits=3, hs_full=True, adaptive=True),
 }
-OVERNIGHT = [c for c, v in CONDITIONS.items() if not v["draft"]]
+OVERNIGHT = [c for c, v in CONDITIONS.items() if not v["adaptive"]]
+ADAPTIVE = [c for c, v in CONDITIONS.items() if v["adaptive"]]
 
 
-def parse_conditions(spec: str, allow_draft: bool) -> List[str]:
+def parse_conditions(spec: str) -> List[str]:
     if spec == "all":
         names = list(CONDITIONS)
     elif spec == "overnight":
         names = list(OVERNIGHT)
+    elif spec == "adaptive":
+        names = list(ADAPTIVE)
     else:
         names = [s.strip() for s in spec.split(",") if s.strip()]
     unknown = [n for n in names if n not in CONDITIONS]
     if unknown:
         raise ValueError(f"unknown condition(s) {unknown}; known: {list(CONDITIONS)}")
-    drafts = [n for n in names if CONDITIONS[n]["draft"]]
-    if drafts and not allow_draft:
-        raise ValueError(
-            f"{drafts}: P3/Q3 sensitivity/allocation design is pending; pass "
-            "--allow-draft-p3q3 to run the current draft implementation."
-        )
     return names
 
 
@@ -488,7 +491,7 @@ def q2_uniform_budget_bytes(model, bits: int, n_uncompressed: int) -> int:
 
 # ── Compression dispatch ──────────────────────────────────────────────────────
 
-def compress(name: str, cond: dict, model, stats, calib_ids, cfg) -> dict:
+def compress(name: str, cond: dict, model, stats, calib_ids, cfg, out_dir: Optional[Path] = None) -> dict:
     """Apply the condition's compression in place.  Returns a small JSON-able
     `info` dict plus timing; large return dicts are reduced and deleted here."""
     from task1_compression.prune_magnitude import magnitude_prune
@@ -548,17 +551,68 @@ def compress(name: str, cond: dict, model, stats, calib_ids, cfg) -> dict:
         del res, umask
 
     elif method == "nonuniform_wanda":
-        from task1_compression.prune_nonuniform import measure_block_sensitivity, nonuniform_prune
+        from task1_compression.prune_nonuniform import (LAMBDA_GRID, S_MAX, S_MIN, _spearman,
+                                                        block_sensitivity, outlier_proxy_sensitivity,
+                                                        p2_zero_count, projection_shapes, select_lambda)
+        S = cond["sparsity"]
+        shapes = projection_shapes(model)
+        # Rejected alternative (weight-only), measured untimed for the record.
+        proxy = outlier_proxy_sensitivity(model)
+        originals_cpu = _cpu_originals(model)
         t0 = tic()
-        sens = measure_block_sensitivity(model, stats, probe_sparsity=0.5, device=dev)
-        masks, block_s = nonuniform_prune(model, cond["sparsity"], sens, stats, device=dev)
+        sens = block_sensitivity(model, stats, S, dev)
+        sel = select_lambda(model, stats, S, cfg["dev_ids"], originals_cpu, dev, LAMBDA_GRID,
+                            ppl_dtype=_ppl_dtype(dev), batch_size=cfg["ppl_batch_size"], sens=sens)
         secs = toc(t0)
-        timing_note = "DRAFT P3: sensitivity measurement + allocation + pruning"
-        info["draft_design"] = True
-        info["block_sensitivity"] = {str(k): float(v) for k, v in sens.items()}
-        info["block_sparsity"] = {str(k): float(v) for k, v in block_s.items()}
+        del originals_cpu
+        timing_note = ("block sensitivity (Gram) + lambda selection on 32 dev seqs (5 allocate/prune/dev-PPL "
+                       "passes) + final pruning; outlier-proxy record excluded")
+        p2z = p2_zero_count(shapes, S)
+        alloc, masks = sel["alloc"], sel["masks"]
+        blocks = sorted(sens["per_block"])
+        info["p3"] = {
+            "unit": "Transformer block (all 7 eligible projections share s_l)",
+            "sensitivity_definition": sens["definition"],
+            "s_probe": S,
+            "block_sensitivity": {str(l): sens["per_block"][l] for l in blocks},
+            "projection_probe_rel_err": {n: v["rel"] for n, v in sens["per_projection"].items()},
+            "rank_normalised": {str(l): alloc["rank"][l] for l in blocks},
+            "rule": "s_l = clip(S + lam*(1 - 2 r_l) + c, %.2f, %.2f); c by bisection; largest-remainder "
+                    "integerisation per projection, per-row counts differ by <= 1" % (S_MIN, S_MAX),
+            "lambda_grid": list(LAMBDA_GRID),
+            "lambda": sel["lam"],
+            "offset_c": alloc["offset"],
+            "dev_selection": sel["grid"],
+            "block_sparsity": {str(l): alloc["s_block"][l] for l in blocks},
+            "achieved_projection_sparsity": {n: v["achieved_sparsity"] for n, v in masks.items()},
+            "achieved_projection_zeros": {n: v["zeros"] for n, v in masks.items()},
+            "target_zeros_round_S_N": alloc["target_zeros"],
+            "achieved_zeros": sel["achieved_zeros"],
+            "p2_zero_count_same_S": p2z,
+            "matches_p2_zero_count": sel["achieved_zeros"] == p2z,
+            "rejected_outlier_proxy": {
+                "definition": "OWL-style weight-only: mean over the block's projections of max|W|/mean|W|",
+                "per_block": {str(l): proxy[l] for l in blocks},
+                "spearman_vs_gram_sensitivity": _spearman([proxy[l] for l in blocks],
+                                                          [sens["per_block"][l] for l in blocks]),
+                "why_rejected": "ignores activations and the mask actually applied; does not measure the "
+                                "output error pruning causes",
+            },
+        }
+        # Back-compat keys used by older plots.
+        info["block_sensitivity"] = info["p3"]["block_sensitivity"]
+        info["block_sparsity"] = info["p3"]["block_sparsity"]
         info["mask_sparsity"] = _mask_sparsity(masks)
-        del masks
+        if out_dir is not None:
+            _write_json(out_dir / f"{name}_selection.json",
+                        {"condition": name, "selected_on": "32 C4 development sequences (positions 1..L-1)",
+                         "development_sha256": cfg.get("development_sha256"),
+                         "criterion": "lowest development PPL (ties -> smaller lambda)",
+                         "lambda": sel["lam"], "grid": sel["grid"],
+                         "block_sensitivity": info["p3"]["block_sensitivity"],
+                         "block_sparsity": info["p3"]["block_sparsity"],
+                         "outlier_proxy": info["p3"]["rejected_outlier_proxy"]["per_block"]}, indent=1)
+        del masks, sel
 
     elif method == "uniform":
         b = cond["bits"]
@@ -607,36 +661,86 @@ def compress(name: str, cond: dict, model, stats, calib_ids, cfg) -> dict:
         del res, searched
 
     elif method == "mixed":
-        from task1_compression.quant_mixed import (allocate_bits, measure_all_sensitivities,
-                                                   mixed_precision_quantize)
+        from task1_compression.quant_mixed import (ALLOWED_BITS, BMIN_GRID, bit_error_table, select_bmin)
         b = cond["bits"]
         n_unc = sum(p.numel() for p in model.parameters()) - count_eligible_params(model)["total"]
         budget = q2_uniform_budget_bytes(model, b, n_unc)
+        fixed = 2 * n_unc
+        originals_cpu = _cpu_originals(model)
         t0 = tic()
-        sens = measure_all_sensitivities(model, stats)
-        alloc = allocate_bits(sens, model, budget, n_unc)
-        res = mixed_precision_quantize(model, stats, alloc)
-        secs = toc(t0)
-        timing_note = "DRAFT Q3: sensitivity + allocation + AWQ-style quantization"
+        tab = bit_error_table(model, stats, ALLOWED_BITS, GROUP_SIZE, dev, cfg.get("q3_table_cache"),
+                              {"model_id": cfg["model_id"], "model_revision": cfg["model_revision"],
+                               "calibration_sha256": cfg["calibration_sha256"]})
+        t_table_here = toc(t0)
+        t1 = tic()
+        sel = select_bmin(model, tab["table"], budget, fixed, cfg["dev_ids"], originals_cpu, dev, BMIN_GRID,
+                          ppl_dtype=_ppl_dtype(dev), batch_size=cfg["ppl_batch_size"])
+        t_sel = toc(t1)
+        del originals_cpu
+        # Count the table's build time even when it came from the cache.
+        t_table = max(t_table_here, float(tab["build_seconds"]))
+        secs = t_table + t_sel
+        timing_note = ("bit-error table build (196 x 4 AWQ searches; build time counted even when reused "
+                       "from cache) + b_min selection on 32 dev seqs (2 allocate/quantize/dev-PPL passes) "
+                       "+ final quantization")
+        res = sel["per_projection"]
+        alloc = sel["alloc"]
         quant_bytes = {"payload": sum(v["packed_bytes"] for v in res.values()),
                        "metadata": sum(v["metadata_bytes"] for v in res.values()),
                        "compensating": sum(v["compensating_scale_bytes"] for v in res.values())}
+        total = sum(quant_bytes.values()) + fixed
+        assert total == alloc["total_bytes"], (total, alloc["total_bytes"])
+        assert total <= budget, f"Q3 total {total} exceeds Q2 budget {budget}"
         sizes = {n: m.weight.numel() for n, m in enumerate_eligible_projections(model)}
-        nominal_bits = sum(sizes[n] * alloc[n] for n in alloc) / sum(sizes.values())
-        total = sum(quant_bytes.values()) + 2 * n_unc
-        info["draft_design"] = True
+        nominal_bits = sum(sizes[n] * alloc["bits"][n] for n in alloc["bits"]) / sum(sizes.values())
         info["quantizer"] = _quantizer_desc(None)
-        info["bit_assignment"] = dict(alloc)
-        info["sensitivity"] = {n: float(v) for n, v in sens.items()}
-        info["matched_budget_check"] = {"budget_bytes_q2_uniform": budget, "total_packed_bytes": total,
-                                        "within_budget": total <= budget}
-        del res
+        info["q3"] = {
+            "unit": "individual eligible projection",
+            "allowed_bits": list(ALLOWED_BITS),
+            "quantizer": "quant_awq.awq_scale_search + awq_compensated_weight, unchanged (Q2)",
+            "error_definition": "rel_err = tr(D G D^T)/tr(W G W^T), D = W_hat_b - W, G from the unmodified FP16 model",
+            "rule": "start at b_min; greedily take the feasible upgrade with max (rel_err decrease)/(byte increase)",
+            "b_min_grid": list(BMIN_GRID),
+            "b_min": sel["b_min"],
+            "dev_selection": sel["grid"],
+            "bit_assignment": dict(alloc["bits"]),
+            "error_table": {n: {str(bb): {"rel_err": v["rel_err"], "bytes": v["bytes"], "best_exp": v["best_exp"]}
+                                for bb, v in row.items()} for n, row in tab["table"].items()},
+            "table_build_seconds": float(tab["build_seconds"]),
+            "budget_check": {"budget_definition": f"TOTAL bytes of Q2 uniform INT{b}: payload + FP16 scale/zero "
+                                                  "metadata + 2*d_in compensating + FP16 uncompressed (tied once)",
+                             "budget_bytes_q2_uniform": budget, "q3_total_bytes": total,
+                             "fixed_uncompressed_fp16_bytes": fixed, "headroom_bytes": budget - total,
+                             "within_budget": total <= budget},
+        }
+        # Back-compat keys used by older plots.
+        info["bit_assignment"] = dict(alloc["bits"])
+        info["sensitivity"] = {n: row[3]["rel_err"] for n, row in tab["table"].items() if 3 in row}
+        info["matched_budget_check"] = info["q3"]["budget_check"]
+        if out_dir is not None:
+            _write_json(out_dir / f"{name}_selection.json",
+                        {"condition": name, "selected_on": "32 C4 development sequences (positions 1..L-1)",
+                         "development_sha256": cfg.get("development_sha256"),
+                         "criterion": "lowest development PPL (ties -> larger b_min)",
+                         "b_min": sel["b_min"], "grid": sel["grid"],
+                         "budget_check": info["q3"]["budget_check"]}, indent=1)
+        del res, sel, tab
+
     else:
         raise ValueError(method)
 
     _free(dev)
     return {"info": info, "compression_seconds": secs, "compression_timing_note": timing_note,
             "quant_bytes": quant_bytes, "nominal_bits": nominal_bits}
+
+
+def _cpu_originals(model) -> Dict[str, torch.Tensor]:
+    """CPU FP16 copies of every eligible weight, used to restore between dev-selection passes."""
+    return {n: m.weight.data.detach().to("cpu", copy=True) for n, m in enumerate_eligible_projections(model)}
+
+
+def _ppl_dtype(device: str):
+    return torch.float16 if str(device).startswith("cuda") else torch.bfloat16
 
 
 def _quantizer_desc(bits):
@@ -656,7 +760,7 @@ def _mask_sparsity(res: dict) -> dict:
         items = [v["mask"] for k, v in res.items() if _proj_type(k) == t]
         nt = sum(m.numel() for m in items)
         by_type[t] = 1.0 - sum(int(m.sum()) for m in items) / nt if nt else None
-    return {"global": 1.0 - kept / n, "by_type": by_type}
+    return {"global": 1.0 - kept / n, "by_type": by_type, "zeros": n - kept, "n": n}
 
 
 def _mask_overlap(res24: dict, umask: dict) -> dict:
@@ -706,7 +810,7 @@ def run_condition(name: str, cfg: dict, load_model: Callable, get_stats: Callabl
     if cond["method"] != "fp16":
         originals = {n: m.weight.data.detach().clone() for n, m in enumerate_eligible_projections(model)}
 
-    comp = compress(name, cond, model, stats, calib_ids, cfg)
+    comp = compress(name, cond, model, stats, calib_ids, cfg, out_dir)
     print(f"[{name}] compression {comp['compression_seconds']:.1f}s")
 
     calib_err = calibration_output_error(model, originals, stats, dev)
@@ -748,7 +852,7 @@ def run_condition(name: str, cfg: dict, load_model: Callable, get_stats: Callabl
     summary = {
         "condition": name,
         "family": cond["family"], "method": cond["method"], "target_sparsity": cond["sparsity"],
-        "bits": cond["bits"], "draft": cond["draft"], "hs_full": cond["hs_full"],
+        "bits": cond["bits"], "adaptive": cond["adaptive"], "hs_full": cond["hs_full"],
         "seed": SEED,
         "env": _env(cfg, model),
         "compression_seconds": comp["compression_seconds"],
@@ -814,6 +918,10 @@ def run(cfg: dict, conditions: List[str], load_model: Optional[Callable] = None)
     calib_path = Path(cfg["data_root"]) / FILES["calibration"]
     calib_ids = [r["token_ids"] for r in _iter_jsonl(calib_path)]
     cfg["calibration_sha256"] = _sha256_file(calib_path)
+    if any(CONDITIONS[c]["adaptive"] for c in conditions):
+        dev_path = Path(cfg["data_root"]) / FILES["development"]
+        cfg["dev_ids"] = [r["token_ids"] for r in _iter_jsonl(dev_path)]
+        cfg["development_sha256"] = _sha256_file(dev_path)
 
     holder = {}
 
@@ -851,8 +959,11 @@ def run(cfg: dict, conditions: List[str], load_model: Optional[Callable] = None)
 
 # ── Aggregation ───────────────────────────────────────────────────────────────
 
-BOOTSTRAP_PAIRS = [("p3_s50", "p2_s50"), ("p3_s75", "p2_s75"),
-                   ("q3_int4", "q2_int4"), ("q3_int3", "q2_int3")]
+# (adaptive, uniform reference, HellaSwag population): P3-P2 at 50% on the full 2,000
+# IDs, at 75% on the 512 subset (P2-75 is a subset condition); Q3-Q2 on the full set.
+# Both PPL suites for every pair.
+BOOTSTRAP_PAIRS = [("p3_s50", "p2_s50", HS_FULL_N), ("p3_s75", "p2_s75", HS_SUBSET_N),
+                   ("q3_int4", "q2_int4", HS_FULL_N), ("q3_int3", "q2_int3", HS_FULL_N)]
 
 
 def _load(root: Path, cond: str, fname: str):
@@ -880,7 +991,8 @@ def aggregate(results_root: str, data_root: Optional[str] = None) -> dict:
         lat = s["latency"]
         row = {
             "condition": c, "family": s["family"], "method": s["method"],
-            "target_sparsity": s["target_sparsity"], "bits": s["bits"], "draft": s["draft"],
+            "target_sparsity": s["target_sparsity"], "bits": s["bits"],
+            "adaptive": s.get("adaptive", s.get("draft")),
             "achieved_eligible_sparsity": s["sparsity"]["achieved_eligible_sparsity"],
             "effective_nonzeros": s["sparsity"]["effective_nonzeros"],
             "nominal_bits_per_eligible": st["nominal_bits_per_eligible"],
@@ -921,13 +1033,18 @@ def aggregate(results_root: str, data_root: Optional[str] = None) -> dict:
 
     # Paired bootstrap P3-P2 and Q3-Q2.
     boot = {}
-    for b_name, a_name in BOOTSTRAP_PAIRS:
+    for b_name, a_name, hs_n in BOOTSTRAP_PAIRS:
         if b_name not in summ or a_name not in summ:
             continue
         a_map = {r["order"]: r for r in hs[a_name]}
         b_map = {r["order"]: r for r in hs[b_name]}
-        orders = sorted(set(a_map) & set(b_map))
-        entry = {"difference": f"{b_name} - {a_name}", "hellaswag_n": len(orders)}
+        orders = sorted(o for o in set(a_map) & set(b_map) if o < hs_n)
+        if len(orders) != hs_n:
+            warnings.warn(f"bootstrap {b_name}-{a_name}: {len(orders)} matched HellaSwag IDs, expected {hs_n}")
+        entry = {"difference": f"{b_name} - {a_name}", "hellaswag_n": len(orders),
+                 "hellaswag_population": ("all 2000 locked IDs" if hs_n == HS_FULL_N
+                                          else f"orders 0..{HS_SUBSET_N - 1}"),
+                 "n_resamples": 2000, "seed": SEED}
         for metric in ("acc_norm", "raw_acc"):
             entry[f"hellaswag_{metric}"] = bootstrap_paired_hellaswag(
                 [a_map[o] for o in orders], [b_map[o] for o in orders], metric=metric, seed=SEED)
@@ -936,11 +1053,60 @@ def aggregate(results_root: str, data_root: Optional[str] = None) -> dict:
             entry[f"{key}_ppl"] = bootstrap_paired_ppl(pa, pb, metric="ppl", seed=SEED)
         boot[f"{b_name}_minus_{a_name}"] = entry
     _write_json(root / "bootstrap.json", boot, indent=1)
+    matched = _matched_budget(root, summ)
 
     qual = _qualitative(root, summ, hs, data_root)
     plots = _plots(root, summ, rows)
     return {"n_conditions": len(summ), "table": str(root / "table.csv"), "bootstrap": list(boot),
-            "qualitative_orders": qual, "plots": plots}
+            "matched_budget": matched, "qualitative_orders": qual, "plots": plots}
+
+
+def _zeros_of(s: dict) -> Optional[int]:
+    ms = s["sparsity"].get("mask_sparsity") or {}
+    if "zeros" in ms:
+        return int(ms["zeros"])
+    if "global" in ms:
+        return int(round(ms["global"] * s["sparsity"]["n_eligible"]))
+    return None
+
+
+def _matched_budget(root: Path, summ: dict) -> List[dict]:
+    """P3 vs P2 eligible zeros at the same S; Q3 vs Q2 total packed bytes."""
+    rows = []
+    for a, ref in (("p3_s50", "p2_s50"), ("p3_s75", "p2_s75")):
+        if a not in summ:
+            continue
+        za = _zeros_of(summ[a])
+        p3 = summ[a]["details"].get("p3", {})
+        zr = _zeros_of(summ[ref]) if ref in summ else p3.get("p2_zero_count_same_S")
+        rows.append({"pair": f"{a} vs {ref}", "quantity": "eligible-weight zeros (mask)",
+                     "adaptive": za, "uniform_reference": zr,
+                     "difference": (za - zr) if None not in (za, zr) else None,
+                     "matched": za == zr, "n_eligible": summ[a]["sparsity"]["n_eligible"],
+                     "selected_hyperparameter": f"lambda={p3.get('lambda')}"})
+    for a, ref in (("q3_int4", "q2_int4"), ("q3_int3", "q2_int3")):
+        if a not in summ:
+            continue
+        bc = summ[a]["details"].get("q3", {}).get("budget_check", {})
+        qa = summ[a]["storage"]["packed_quant_bytes"]["value"]
+        qr = (summ[ref]["storage"]["packed_quant_bytes"]["value"] if ref in summ
+              else bc.get("budget_bytes_q2_uniform"))
+        rows.append({"pair": f"{a} vs {ref}", "quantity": "total packed bytes (incl. metadata, "
+                     "compensating scales, FP16 uncompressed)",
+                     "adaptive": qa, "uniform_reference": qr,
+                     "difference": (qa - qr) if None not in (qa, qr) else None,
+                     "matched": (qa <= qr) if None not in (qa, qr) else None,
+                     "budget_from_byte_accounting": bc.get("budget_bytes_q2_uniform"),
+                     "selected_hyperparameter": f"b_min={summ[a]['details'].get('q3', {}).get('b_min')}"})
+    if rows:
+        cols = list(dict.fromkeys(k for r in rows for k in r))
+        with open(root / "matched_budget.csv", "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        _write_json(root / "matched_budget.json", rows, indent=1)
+    return rows
 
 
 def _qualitative(root: Path, summ, hs, data_root) -> List[int]:
@@ -1068,9 +1234,10 @@ def _plots(root: Path, summ: dict, rows: List[dict]) -> List[str]:
     # 3. Calibration error vs held-out quality.
     pts = [r for r in rows if r["condition"] != "fp16" and r["calib_rel_output_err"] > 0]
     if pts:
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
         fam = {"pruning": ("#2a78d6", "o", "pruning"), "quantization": ("#eb6834", "s", "quantization")}
         for ax, (key, label) in zip(axes, [("c4_ppl", "C4 validation PPL"),
+                                           ("wt2_ppl", "WikiText-2 test PPL"),
                                            ("hs512_acc_norm", "HellaSwag acc_norm (first 512)")]):
             _style_ax(ax)
             for f, (col, mk, lab) in fam.items():
@@ -1083,7 +1250,7 @@ def _plots(root: Path, summ: dict, rows: List[dict]) -> List[str]:
                                     color=_INK2, xytext=(3, 3), textcoords="offset points")
             ref_line(ax, key)
             ax.set_xscale("log")
-            if key == "c4_ppl":
+            if key in ("c4_ppl", "wt2_ppl"):
                 ax.set_yscale("log")
             ax.set_xlabel("relative calibration output error (token-weighted mean)")
             ax.set_title(label, fontsize=10)
@@ -1108,37 +1275,93 @@ def _plots(root: Path, summ: dict, rows: List[dict]) -> List[str]:
         fig.colorbar(im, ax=ax)
         save(fig, f"calib_error_heatmap_{c}.png")
 
-    # 5. Adaptive-method sensitivity / allocation maps (P3, Q3) when present.
-    for c in ("p3_s50", "p3_s75"):
-        s = summ.get(c)
-        if s and "block_sparsity" in s["details"]:
-            bs = s["details"]["block_sparsity"]
-            sens = s["details"].get("block_sensitivity", {})
-            ks = sorted(bs, key=int)
-            fig, axes = plt.subplots(1, 2, figsize=(11, 3.5))
-            for ax, vals, lab in ((axes[0], [sens.get(k, 0.0) for k in ks], "block sensitivity"),
-                                  (axes[1], [bs[k] for k in ks], "allocated block sparsity")):
-                _style_ax(ax)
-                ax.bar([int(k) for k in ks], vals, color="#2a78d6", width=0.8)
-                ax.set_xlabel("layer")
-                ax.set_title(f"{c}: {lab}", fontsize=10)
-            save(fig, f"{c}_sensitivity_allocation.png")
-    for c in ("q3_int4", "q3_int3"):
-        s = summ.get(c)
-        if s and "bit_assignment" in s["details"]:
-            ba = s["details"]["bit_assignment"]
-            sens = s["details"].get("sensitivity", {})
-            layers = sorted({int(n.split(".layers.")[1].split(".")[0]) for n in ba})
-            fig, axes = plt.subplots(1, 2, figsize=(10, max(3, 0.18 * len(layers) + 1)))
-            for ax, src, lab, norm in ((axes[0], sens, "sensitivity", LogNorm()),
-                                       (axes[1], ba, "assigned bits", None)):
-                grid = [[max(float(src.get(_pname(l, t), 0.0)), 1e-12) for t in ELIGIBLE_SUFFIXES] for l in layers]
-                im = ax.imshow(grid, aspect="auto", cmap="Blues", norm=norm)
-                ax.set_xticks(range(len(ELIGIBLE_SUFFIXES)), ELIGIBLE_SUFFIXES, rotation=45, fontsize=7)
-                ax.set_yticks(range(len(layers)), layers, fontsize=6)
-                ax.set_title(f"{c}: {lab}", fontsize=9)
-                fig.colorbar(im, ax=ax)
-            save(fig, f"{c}_sensitivity_bits.png")
+    # 5. P3: per-block sensitivity (bars) with the chosen s_l overlaid, at 50% and 75%.
+    p3s = [(c, summ[c]["details"]["p3"]) for c in ("p3_s50", "p3_s75") if c in summ and "p3" in summ[c]["details"]]
+    if p3s:
+        fig, axes = plt.subplots(1, len(p3s), figsize=(6.5 * len(p3s), 3.8), squeeze=False)
+        for ax, (c, d) in zip(axes[0], p3s):
+            _style_ax(ax)
+            ks = sorted(d["block_sensitivity"], key=int)
+            x = [int(k) for k in ks]
+            ax.bar(x, [d["block_sensitivity"][k] for k in ks], color="#2a78d6", width=0.8,
+                   label=f"sensitivity (rel. Gram error at s_probe={d['s_probe']:.2f})")
+            ax.set_xlabel("block")
+            ax.set_ylabel("block sensitivity")
+            ax2 = ax.twinx()
+            ax2.plot(x, [d["block_sparsity"][k] for k in ks], color="#eb6834", marker="s", markersize=4,
+                     linewidth=2, label="chosen s_l")
+            ax2.axhline(d["s_probe"], color=_MUTED, linestyle="--", linewidth=1, label="global S")
+            ax2.set_ylim(0.0, 1.0)
+            ax2.set_ylabel("allocated block sparsity s_l", color=_INK2)
+            ax2.tick_params(colors=_INK2, labelsize=8)
+            for side in ("top",):
+                ax2.spines[side].set_visible(False)
+            ax.set_title(f"{c}: block sensitivity and s_l (lambda={d['lambda']})", fontsize=10)
+            h1, l1 = ax.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
+            ax.legend(h1 + h2, l1 + l2, fontsize=7, frameon=False, loc="upper left")
+        save(fig, "p3_sensitivity_allocation.png")
+
+    # 6. Q3: layer x projection-type heatmaps: rel. error at 3 bits; assigned bits INT4 / INT3.
+    q3s = [(c, summ[c]["details"]["q3"]) for c in ("q3_int4", "q3_int3") if c in summ and "q3" in summ[c]["details"]]
+    if q3s:
+        from matplotlib.colors import BoundaryNorm, ListedColormap
+        tab = q3s[0][1]["error_table"]
+        layers = sorted({int(n.split(".layers.")[1].split(".")[0]) for n in tab})
+        fig, axes = plt.subplots(1, 1 + len(q3s), figsize=(4.6 * (1 + len(q3s)), max(3.5, 0.2 * len(layers) + 1.5)))
+        sens_grid = [[max(tab.get(_pname(l, t), {}).get("3", {}).get("rel_err", 0.0), 1e-12)
+                      for t in ELIGIBLE_SUFFIXES] for l in layers]
+        im = axes[0].imshow(sens_grid, aspect="auto", cmap="Blues", norm=LogNorm())
+        axes[0].set_title("Q3 sensitivity: rel. Gram error at 3 bits", fontsize=9)
+        fig.colorbar(im, ax=axes[0])
+        bit_vals = [2, 3, 4, 8]
+        cmap = ListedColormap(["#cde2f7", "#7fb2ea", "#2a78d6", "#0b3d7a"])
+        bnorm = BoundaryNorm([1.5, 2.5, 3.5, 6, 9], cmap.N)
+        for ax, (c, d) in zip(axes[1:], q3s):
+            ba = d["bit_assignment"]
+            grid = [[ba.get(_pname(l, t), 0) for t in ELIGIBLE_SUFFIXES] for l in layers]
+            im = ax.imshow(grid, aspect="auto", cmap=cmap, norm=bnorm)
+            ax.set_title(f"{c}: assigned bits (b_min={d['b_min']})", fontsize=9)
+            cb = fig.colorbar(im, ax=ax, ticks=bit_vals)
+            cb.ax.set_yticklabels([str(v) for v in bit_vals])
+        for ax in axes:
+            ax.set_xticks(range(len(ELIGIBLE_SUFFIXES)), ELIGIBLE_SUFFIXES, rotation=45, fontsize=7)
+            ax.set_yticks(range(len(layers)), layers, fontsize=6)
+            ax.set_ylabel("layer")
+        save(fig, "q3_sensitivity_bits.png")
+
+    # 7. Development-selection curves (P3 lambda, Q3 b_min).
+    if p3s or q3s:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
+        _style_ax(axes[0])
+        _style_ax(axes[1])
+        cols = {"p3_s50": ("#2a78d6", "o"), "p3_s75": ("#eb6834", "s"),
+                "q3_int4": ("#2a78d6", "o"), "q3_int3": ("#eb6834", "s")}
+        for c, d in p3s:
+            g = d["dev_selection"]
+            col, mk = cols[c]
+            axes[0].plot([p["lam"] for p in g], [p["dev_ppl"] for p in g], color=col, marker=mk, linewidth=2, label=c)
+            axes[0].scatter([d["lambda"]], [min(p["dev_ppl"] for p in g)], s=120, facecolors="none",
+                            edgecolors=_INK, linewidths=1.5)
+        axes[0].set_xlabel("lambda")
+        axes[0].set_ylabel("development PPL (32 C4 seqs)")
+        axes[0].set_yscale("log")
+        axes[0].set_title("P3 lambda selection (circled = chosen)", fontsize=10)
+        if p3s:
+            axes[0].legend(fontsize=8, frameon=False)
+        for c, d in q3s:
+            g = [p for p in d["dev_selection"] if p.get("feasible")]
+            col, mk = cols[c]
+            axes[1].plot([p["b_min"] for p in g], [p["dev_ppl"] for p in g], color=col, marker=mk, linewidth=2, label=c)
+            axes[1].scatter([d["b_min"]], [min(p["dev_ppl"] for p in g)], s=120, facecolors="none",
+                            edgecolors=_INK, linewidths=1.5)
+        axes[1].set_xticks(list(range(2, 4)))
+        axes[1].set_xlabel("b_min")
+        axes[1].set_ylabel("development PPL (32 C4 seqs)")
+        axes[1].set_title("Q3 b_min selection (circled = chosen)", fontsize=10)
+        if q3s:
+            axes[1].legend(fontsize=8, frameon=False)
+        save(fig, "dev_selection_curves.png")
     return made
 
 
@@ -1154,14 +1377,15 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run conditions")
     r.add_argument("--conditions", default="overnight",
-                   help="comma list, 'overnight' (14 non-draft) or 'all' (18; drafts need the flag)")
+                   help="comma list, 'overnight' (14 non-adaptive), 'adaptive' (P3/Q3) or 'all' (18)")
     r.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
     r.add_argument("--results-root", default=DEFAULT_RESULTS_ROOT)
     r.add_argument("--device", default=None, help="default: cuda if available else cpu")
     r.add_argument("--overwrite", action="store_true")
-    r.add_argument("--allow-draft-p3q3", action="store_true")
     r.add_argument("--calib-cache", default=DEFAULT_CALIB_CACHE,
                    help="local (not Drive) path for the cached with_gram=True stats; '' disables")
+    r.add_argument("--q3-table-cache", default=DEFAULT_Q3_TABLE_CACHE,
+                   help="local path for the cached Q3 bit-error table; '' disables")
     r.add_argument("--expected-n", type=int, default=50000,
                    help="expected scored tokens per perplexity file (override only for tests)")
     r.add_argument("--revisions", default=DEFAULT_REVISIONS)
@@ -1179,7 +1403,7 @@ def main(argv=None, load_model: Optional[Callable] = None):
         print(json.dumps(res, indent=1))
         return res
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    conditions = parse_conditions(args.conditions, args.allow_draft_p3q3)
+    conditions = parse_conditions(args.conditions)
     revs = load_revisions(args.revisions)
     cfg = {
         "device": device,
@@ -1187,6 +1411,7 @@ def main(argv=None, load_model: Optional[Callable] = None):
         "results_root": args.results_root,
         "overwrite": args.overwrite,
         "calib_cache": args.calib_cache or None,
+        "q3_table_cache": args.q3_table_cache or None,
         "expected_n": args.expected_n,
         "ppl_batch_size": args.ppl_batch_size or (4 if device.startswith("cuda") else 1),
         "revisions": revs,

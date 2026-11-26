@@ -3,8 +3,9 @@ CPU smoke test for task1_compression.run_task1 (no downloads).
 
 Builds a tiny random Qwen2 (fresh, identically seeded weights per load), a fake
 word-level tokenizer and tiny synthetic locked data files, then runs
-fp16, p1_s50, p2_s50, p2_24, q1_int4, q2_int4 end to end on CPU, checks the output
-files and summary fields, resumability, the P3/Q3 draft gate, and aggregate.
+fp16, p1_s50, p2_s50, p3_s50, p2_24, q1_int4, q2_int4, q3_int4 end to end on CPU,
+checks the output files and summary fields (incl. P3/Q3 matched budgets and dev
+selection files), resumability, condition groups, and aggregate.
 """
 
 import csv
@@ -28,7 +29,7 @@ except Exception:  # pragma: no cover
     HAS_TF = False
 
 VOCAB = 256
-SMOKE = ["fp16", "p1_s50", "p2_s50", "p2_24", "q1_int4", "q2_int4"]
+SMOKE = ["fp16", "p1_s50", "p2_s50", "p3_s50", "p2_24", "q1_int4", "q2_int4", "q3_int4"]
 
 
 class WordTokenizer:
@@ -104,7 +105,8 @@ class TestRunTask1Smoke(unittest.TestCase):
         cls.n = make_data(cls.data)
         cls.base_args = ["run", "--data-root", cls.data, "--results-root", cls.results,
                          "--device", "cpu", "--expected-n", str(cls.n),
-                         "--calib-cache", os.path.join(cls.tmp, "calib_stats.pt")]
+                         "--calib-cache", os.path.join(cls.tmp, "calib_stats.pt"),
+                         "--q3-table-cache", os.path.join(cls.tmp, "q3_table.pt")]
         cls.status = run_task1.main(cls.base_args + ["--conditions", ",".join(SMOKE)],
                                     load_model=tiny_loader)
 
@@ -119,6 +121,7 @@ class TestRunTask1Smoke(unittest.TestCase):
     def test_registry(self):
         self.assertEqual(len(self.rt.CONDITIONS), 18)
         self.assertEqual(len(self.rt.OVERNIGHT), 14)
+        self.assertEqual(self.rt.ADAPTIVE, ["p3_s50", "p3_s75", "q3_int4", "q3_int3"])
         full = {c for c, v in self.rt.CONDITIONS.items() if v["hs_full"]}
         self.assertEqual(full, {"fp16", "p1_s50", "p2_s50", "p3_s50", "q1_int4", "q1_int3",
                                 "q2_int4", "q2_int3", "q3_int4", "q3_int3"})
@@ -169,13 +172,36 @@ class TestRunTask1Smoke(unittest.TestCase):
         self.assertLess(pr["projection_level"]["max_rel_output_err_fp32"], 1e-10)
         self.assertLess(pr["model_level"]["max_abs_logit_diff"], 1e-3)
 
-    def test_resume_skips_and_draft_gate(self):
-        status = self.rt.main(self.base_args + ["--conditions", "fp16"], load_model=tiny_loader)
-        self.assertEqual(status, {"fp16": "skipped"})
+    def test_p3_q3_fields(self):
+        p3 = self._summary("p3_s50")
+        d = p3["details"]["p3"]
+        self.assertTrue(d["matches_p2_zero_count"])
+        p2 = self._summary("p2_s50")
+        self.assertEqual(p3["sparsity"]["mask_sparsity"]["zeros"], p2["sparsity"]["mask_sparsity"]["zeros"])
+        self.assertEqual(len(d["dev_selection"]), 5)
+        self.assertIn(d["lambda"], d["lambda_grid"])
+        for v in d["block_sparsity"].values():
+            self.assertTrue(0.10 - 1e-9 <= v <= 0.85 + 1e-9)
+        self.assertEqual(set(d["rejected_outlier_proxy"]["per_block"]), set(d["block_sensitivity"]))
+        self.assertTrue(os.path.exists(os.path.join(self.results, "p3_s50", "p3_s50_selection.json")))
+        q3 = self._summary("q3_int4")
+        bc = q3["details"]["q3"]["budget_check"]
+        self.assertTrue(bc["within_budget"])
+        self.assertLessEqual(q3["storage"]["packed_quant_bytes"]["value"],
+                             self._summary("q2_int4")["storage"]["packed_quant_bytes"]["value"])
+        self.assertEqual(bc["budget_bytes_q2_uniform"],
+                         self._summary("q2_int4")["storage"]["packed_quant_bytes"]["value"])
+        self.assertIn(q3["details"]["q3"]["b_min"], (2, 3))
+        self.assertTrue(os.path.exists(os.path.join(self.results, "q3_int4", "q3_int4_selection.json")))
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "q3_table.pt")))
+
+    def test_resume_skips_and_condition_groups(self):
+        status = self.rt.main(self.base_args + ["--conditions", "fp16,p3_s50"], load_model=tiny_loader)
+        self.assertEqual(status, {"fp16": "skipped", "p3_s50": "skipped"})
+        self.assertEqual(self.rt.parse_conditions("adaptive"), self.rt.ADAPTIVE)
+        self.assertEqual(len(self.rt.parse_conditions("all")), 18)
         with self.assertRaises(ValueError):
-            self.rt.main(self.base_args + ["--conditions", "p3_s50"], load_model=tiny_loader)
-        with self.assertRaises(ValueError):
-            self.rt.main(self.base_args + ["--conditions", "all"], load_model=tiny_loader)
+            self.rt.parse_conditions("p9_s50")
 
     def test_aggregate(self):
         res = self.rt.main(["aggregate", "--results-root", self.results, "--data-root", self.data])
@@ -188,10 +214,20 @@ class TestRunTask1Smoke(unittest.TestCase):
         self.assertEqual(len({r["order"] for r in q}), 8)
         self.assertTrue(os.path.exists(os.path.join(self.results, "qualitative_orders.json")))
         self.assertTrue(os.path.exists(os.path.join(self.results, "bootstrap.json")))
+        with open(os.path.join(self.results, "bootstrap.json")) as fh:
+            boot = json.load(fh)
+        self.assertIn("p3_s50_minus_p2_s50", boot)
+        self.assertIn("q3_int4_minus_q2_int4", boot)
+        mb = {r["pair"]: r for r in res["matched_budget"]}
+        self.assertTrue(mb["p3_s50 vs p2_s50"]["matched"])
+        self.assertTrue(mb["q3_int4 vs q2_int4"]["matched"])
         try:
             import matplotlib  # noqa: F401
             self.assertIn("pruning_quality_vs_sparsity.png", res["plots"])
             self.assertIn("quant_quality_vs_packed_bytes.png", res["plots"])
+            for f in ("p3_sensitivity_allocation.png", "q3_sensitivity_bits.png", "dev_selection_curves.png",
+                      "calib_error_vs_quality.png"):
+                self.assertIn(f, res["plots"])
         except ImportError:
             pass
 

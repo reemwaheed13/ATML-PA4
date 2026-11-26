@@ -77,13 +77,14 @@ Session split (parallel work):
   does not call the calibration functions, so nothing breaks, but any real Task-1
   run should use `collect_calibration_stats(...)` (with `with_gram=True` for AWQ/Q3,
   `with_gram=False` for Wanda) instead of `collect_calibration_inputs`.
-- **`prune_nonuniform.measure_block_sensitivity` is a stub** (`prune_nonuniform.py`):
-  it sets up ref-output hooks then `break`s immediately and falls back to a
-  weight-only OWL-style outlier ratio — it never actually uses the dev activations
-  it's passed. The dead `dev_calibration_inputs` loop and the `pass` branch at
-  ~`:100` are leftovers. P3's sensitivity measure still needs a real
-  calibration-based implementation + justification per PDF §1 step 4. (Not in
-  Session A's items — flagging only.)
+- ~~`prune_nonuniform.measure_block_sensitivity` is a stub~~ — replaced (P3/Q3 session):
+  P3 now uses a block-level Gram sensitivity of the P2 Wanda mask at s_probe = S
+  (`prune_nonuniform.block_sensitivity`), a rank-based allocation with exact global zero
+  matching (`allocate`) and lambda chosen on the 32 dev sequences (`select_lambda`). The
+  OWL weight-only proxy survives as `outlier_proxy_sensitivity()` (rejected alternative,
+  recorded). Q3 uses a per-projection Gram error table of the unchanged Q2 quantizer at
+  {2,3,4,8} bits (`quant_mixed.bit_error_table`), greedy marginal-efficiency allocation
+  under the TOTAL Q2 byte budget (`allocate`) and b_min chosen on dev (`select_bmin`).
 - Only `tests/test_proj_enumeration.py` exists; it covers enumeration/tied weights
   and is unaffected by the above changes. No unit tests yet for masks, calibration
   stats, or perplexity offsets.

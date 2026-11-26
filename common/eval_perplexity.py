@@ -178,3 +178,30 @@ def save_result(result: dict, path: str):
     pw_path = p.with_name(p.stem + "_per_window.json")
     with open(pw_path, "w") as fh:
         json.dump(result["per_window"], fh)
+
+
+@torch.no_grad()
+def perplexity_on_token_ids(model, token_id_lists, device: str, dtype=torch.float16,
+                            batch_size: int = 1) -> dict:
+    """PPL over raw token-id sequences (e.g. the 32 C4 development sequences).
+
+    Every position except 0 is scored (position 0 is context only), each sequence is
+    independent, and PPL = exp(pooled token NLL).  Same NLL path as
+    :func:`evaluate_perplexity`; used for P3/Q3 hyperparameter selection only.
+    """
+    model.eval()
+    recs = [{"token_ids": list(ids)} for ids in token_id_lists]
+    per_window = []
+    i = 0
+    while i < len(recs):
+        batch = recs[i: i + batch_size]
+        i += batch_size
+        if len({len(r["token_ids"]) for r in batch}) == 1:
+            _process_batch(batch, model, device, dtype, per_window)
+        else:
+            for r in batch:
+                _process_batch([r], model, device, dtype, per_window)
+    n = sum(w["n"] for w in per_window)
+    nll = sum(w["nll"] for w in per_window)
+    mean = nll / n if n else float("inf")
+    return {"N": n, "mean_nll": mean, "ppl": math.exp(mean), "n_sequences": len(recs)}
