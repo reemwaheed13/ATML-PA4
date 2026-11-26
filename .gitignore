@@ -1,0 +1,35 @@
+# Raw datasets (live on Drive; never commit raw data)
+data/
+!data/local_source_revisions.json
+
+# Model checkpoints (regenerate from scripts)
+checkpoints/
+
+# Heavy binary artifacts
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Large numpy/pickle arrays in results
+results/**/*.npy
+results/**/*.pkl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment and OS
+.env
+venv/
+.venv/
+.DS_Store
+Thumbs.db

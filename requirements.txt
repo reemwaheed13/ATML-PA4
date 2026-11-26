@@ -1,0 +1,10 @@
+# Pinned per handout "Shared Experimental Conventions"
+transformers==4.57.1
+huggingface_hub==0.36.2
+
+# Other dependencies (Colab provides torch; pin only what Colab does not)
+peft>=0.14.0
+scipy>=1.11.0
+datasets>=2.19.0
+accelerate>=0.34.0
+numpy>=1.26.0
