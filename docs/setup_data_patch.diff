@@ -1,0 +1,9 @@
+--- a/scripts/setup_data.py
++++ b/scripts/setup_data.py
+@@ -131,10 +131,10 @@ def prefix_banks(rev,overwrite=False,limit=None):
+-            gen=torch.Generator(device='cuda').manual_seed(6304+10007*j+(0 if which=='teacher' else 123))
++            gen=torch.manual_seed(6304+10007*j+(0 if which=='teacher' else 123))
+             with torch.inference_mode():
+                 seq=model.generate(ids,max_new_tokens=192,do_sample=True,temperature=1.0,top_p=1.0,top_k=0,
+-                     generator=gen,pad_token_id=tok.eos_token_id)[0,ids.shape[1]:].tolist()
++                     repetition_penalty=1.0,pad_token_id=tok.eos_token_id)[0,ids.shape[1]:].tolist()

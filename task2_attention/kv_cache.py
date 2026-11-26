@@ -129,7 +129,7 @@ def _quantize_groups(
     q_int = torch.clamp(torch.round(x_g / scales) + zeros.float(), 0, max_int).to(torch.int32)
 
     # Remove padding from q_int.
-    q_int = q_int.reshape(-1, L_pad)[:, :orig_size].reshape(*shape_prefix, orig_size)
+    q_int = q_int.reshape(-1, L_pad)[:, :orig_size].reshape(*shape_prefix, orig_size).movedim(-1, dim)
     scales = scales.squeeze(-1).reshape(*shape_prefix, n_groups)
     zeros = zeros.squeeze(-1).reshape(*shape_prefix, n_groups)
 
