@@ -1,5 +1,5 @@
 # Raw datasets (live on Drive; never commit raw data)
-data/
+data/*
 !data/local_source_revisions.json
 
 # Model checkpoints (regenerate from scripts)
