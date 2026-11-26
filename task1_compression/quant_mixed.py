@@ -90,6 +90,11 @@ def allocate_bits(
         name: module.weight.numel()
         for name, module in enumerate_eligible_projections(model)
     }
+    # Serialized FP16 AWQ compensating scales: 2 bytes per input channel (same as Q2).
+    proj_comp_bytes = {
+        name: 2 * module.weight.shape[1]
+        for name, module in enumerate_eligible_projections(model)
+    }
 
     # Fixed overhead: uncompressed parameters (FP16 = 2 bytes each).
     fixed_bytes = n_uncompressed * 2
@@ -98,7 +103,7 @@ def allocate_bits(
         total = fixed_bytes
         for pname, b in assignment.items():
             n = proj_sizes[pname]
-            total += math.ceil(n * b / 8) + math.ceil(n / group_size) * 4
+            total += math.ceil(n * b / 8) + math.ceil(n / group_size) * 4 + proj_comp_bytes[pname]
         return total
 
     # Start from minimum bits.
@@ -140,7 +145,7 @@ def mixed_precision_quantize(
         W = module.weight.data.float().cpu()
         d_out, d_in = W.shape
 
-        from .quant_awq import awq_scale_search, _find_predecessor, SCALE_EXPONENTS
+        from .quant_awq import awq_scale_search, SCALE_EXPONENTS
         best_scale, best_exp, best_err = awq_scale_search(W, calib, bits, group_size, SCALE_EXPONENTS)
 
         W_scaled = W * best_scale.unsqueeze(0)
@@ -153,12 +158,14 @@ def mixed_precision_quantize(
         payload = packed_bytes(q_int[:, :d_in], bits)
         n_groups = math.ceil(d_in / group_size)
         meta = n_groups * 4 * d_out
+        comp = 2 * d_in  # serialized FP16 AWQ compensating scales (same as Q2)
 
         result[name] = {
             "bits": bits,
             "packed_bytes": payload,
             "metadata_bytes": meta,
-            "total_bytes": payload + meta,
+            "compensating_scale_bytes": comp,
+            "total_bytes": payload + meta + comp,
             "calibration_error": best_err,
             "group_size": group_size,
         }
