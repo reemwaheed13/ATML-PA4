@@ -272,7 +272,7 @@ def _plots_b(root: Path, man: dict, runs: Dict[str, dict], plots: Path, sweep) -
                     continue
                 cv = read_json(cp)
                 loss = np.asarray(cv["loss"])
-                w = 50
+                w = max(1, min(50, len(loss)))
                 sm = np.convolve(loss, np.ones(w) / w, mode="valid")
                 ax1.plot(np.arange(w, len(loss) + 1), sm, lw=.8, label=f"K={K} {reg} s{runs[n]['seed']}")
                 steps = [c["step"] for c in cv["checkpoints"]]

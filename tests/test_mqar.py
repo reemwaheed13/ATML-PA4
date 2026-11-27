@@ -265,6 +265,31 @@ class TestDriverSmoke(unittest.TestCase):
             self.assertEqual(st3["linear_K4_mixed_s6304"], "done")
             self.assertTrue((res / "runs" / "window_K4_near_s6304" / "error.json").exists())
 
+    def test_aggregate_on_smoke_runs(self):
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib not installed")
+        from task2_attention.aggregate import aggregate
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            make_fake_repo(td / "repo")
+            runs = ["dense_K16_mixed_s6304", "window_K16_mixed_s6304", "linear_K16_mixed_s6304",
+                    "local_linear_K16_mixed_s6304"]
+            part_b.run_grid(str(td / "t2" / "b"), str(td / "repo"), runs, "cpu", n_updates=2,
+                            cache_dir=str(td / "cache"), log=lambda *_: None)
+            st = aggregate(str(td / "t2"))
+            self.assertEqual(st["b"]["status"], "ok", st["b"])
+            self.assertEqual(st["b"]["n_runs"], 4)
+            self.assertEqual(st["a"]["status"], "missing")
+            self.assertEqual(st["c"]["status"], "missing")
+            import csv
+            rows = list(csv.DictReader(open(td / "t2" / "tables" / "b_runs.csv")))
+            self.assertEqual(len(rows), 4)
+            ctrl = list(csv.DictReader(open(td / "t2" / "tables" / "b_mask_controls.csv")))
+            self.assertEqual(len(ctrl), 3)                      # dense K16 mixed x 3 regimes
+            self.assertTrue((td / "t2" / "tables" / "b3_intervention.csv").exists())
+
     def test_sweep_cpu(self):
         with tempfile.TemporaryDirectory() as td:
             st = part_b.run_sweep(td, "cpu", Ts=(16,), n_warmup=0, n_rep=1, log=lambda *_: None)

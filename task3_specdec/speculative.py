@@ -1,425 +1,366 @@
 """
-Exact speculative sampling (Leviathan et al. 2023).
+Exact speculative sampling (Leviathan et al. 2023) — PDF §3 step 1.
 
-Correctness requirement (PDF §3 step 1):
-  - Accepts a draft proposal x ~ q with probability min(1, p(x)/q(x)).
-  - On rejection, samples from the NORMALIZED POSITIVE RESIDUAL
-    r(y) ∝ [p(y) - q(y)]+ (not from p directly).
-  - If all γ proposals are accepted, samples an additional BONUS TOKEN
-    from p(· | h + accepted).
-  - Cache rollback/advancement must correctly represent the returned prefix.
-  - χ² test: empirical joint sequence frequencies over 100,000 trials must
-    NOT reject correct sampler at p < 0.01; a deliberately incorrect sampler
-    (using p instead of residual) MUST be rejected at p < 0.01.
+ONE pure decision function, `verify_round`, implements accept/reject
+(accept x_i with probability min(1, p_i(x_i)/q_i(x_i))), positive-residual sampling on
+rejection (r ∝ max(p_i - q_i, 0)) and the full-acceptance bonus token (from p_n).  It is
+called unchanged by the real-model decoder (`speculative_generate`) and by the
+multi-step Markov χ² harness (`toy_speculative_sequence`), so the χ² test exercises the
+exact code that produces the real tokens.  Randomness: torch.rand / torch.multinomial
+on the global generators (seed with torch.manual_seed).
 
-Sampling parameters (PDF §3):
-  temperature=1, top_p=1, repetition_penalty=1.0
-  EOS IDs for Qwen2.5-Instruct: {151645, 151643}
+Cache discipline of `speculative_generate` (batch 1):
+  * INVARIANT: after every round, the target and the draft caches hold the committed
+    sequence (prompt + emitted tokens) EXCEPT its last token (the draft may lag by one
+    more token after a fully accepted round; it catches up on its next forward).
+  * prefill: prompt[:-1] into both caches (one forward each).
+  * a round: the draft extends from its cache, proposing n = min(γ, remaining-1) tokens
+    (stopping early at an EOS proposal).  The target receives
+    [committed tokens it has not cached, normally just the last emitted token] + the n
+    proposals in ONE forward, giving the n+1 distributions p_0..p_n.  `verify_round`
+    decides.  Both caches are then `crop()`ped to len(committed) - 1.
+  * n = 0 (one token left before the cap) is a plain target step ("one-token round");
+    the cap can therefore never be overshot.
+  * EOS: an accepted EOS proposal, or an EOS drawn from the residual or bonus, ends
+    generation; nothing after an EOS is emitted.
+Sampling: temperature 1, top-p 1, top-k 0 (full softmax), repetition penalty 1.0.
 """
 
-from typing import Dict, List, Optional, Tuple
+from collections import Counter
+from dataclasses import dataclass, field
+import itertools
+import math
+import time
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
 import torch
 import torch.nn.functional as F
-from scipy.stats import chisquare
-import numpy as np
+
+QWEN_EOS_IDS = frozenset({151645, 151643})
 
 
-# Qwen2.5-Instruct EOS token IDs.
-QWEN_EOS_IDS = {151645, 151643}
+# ── the pure round decision ───────────────────────────────────────────────────
+
+def positive_residual(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Normalised max(p - q, 0).  If p <= q everywhere (p == q) a rejection has
+    probability 0, so the fallback to p is unreachable in exact arithmetic."""
+    r = (p - q).clamp_min(0.0)
+    s = r.sum()
+    return r / s if float(s) > 0.0 else p
 
 
-# ── Core sampling primitives ───────────────────────────────────────────────────
+@dataclass
+class RoundResult:
+    tokens: List[int]          # emitted this round (accepted proposals + residual/bonus token)
+    n_accepted: int            # accepted proposals
+    n_examined: int            # proposals that went through the accept test
+    n_proposed: int            # proposals drafted
+    bonus: bool                # full acceptance -> bonus token from p_n
+    rejected: bool             # a proposal was rejected -> residual token
+    eos: bool                  # an EOS token was emitted (generation ends)
 
-def _temperature_sample(logits: torch.Tensor, temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+
+def verify_round(p: torch.Tensor, q: torch.Tensor, proposals: Sequence[int],
+                 eos_ids=frozenset(), residual_fn: Callable = positive_residual) -> RoundResult:
+    """Exact speculative decision for one round.
+
+    p          (n+1, V) target probabilities; p[i] is the distribution of the token that
+               follows prefix + proposals[:i]
+    q          (n, V)   draft probabilities from which proposals[i] was drawn
+    proposals  n draft tokens (n may be 0: the round is a plain target sample)
+    residual_fn  positive_residual for the exact sampler; the χ² negative control
+               passes `lambda p, q: p`.
     """
-    Sample from logits with given temperature.
-    Returns (sampled_token_id, full_probability_vector).
-    """
-    if temperature != 1.0:
-        logits = logits / temperature
-    probs = F.softmax(logits, dim=-1)
-    token = torch.multinomial(probs, num_samples=1).squeeze(-1)
-    return token, probs
+    n = len(proposals)
+    assert p.shape[0] == n + 1 and (n == 0 or q.shape[0] == n)
+    out: List[int] = []
+    for i, x in enumerate(proposals):
+        qx = float(q[i, x])
+        a = 1.0 if qx <= 0.0 else min(1.0, float(p[i, x]) / qx)
+        if float(torch.rand(())) < a:
+            out.append(int(x))
+            if int(x) in eos_ids:
+                return RoundResult(out, i + 1, i + 1, n, False, False, True)
+        else:
+            y = int(torch.multinomial(residual_fn(p[i], q[i]), 1))
+            out.append(y)
+            return RoundResult(out, i, i + 1, n, False, True, y in eos_ids)
+    y = int(torch.multinomial(p[n], 1))
+    out.append(y)
+    return RoundResult(out, n, n, n, True, False, y in eos_ids)
 
 
-def _residual_sample(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """
-    Sample from the normalized positive residual r(y) ∝ [p(y) - q(y)]+.
-    p, q: probability vectors (V,), sum to 1.
-    Returns sampled token id (scalar tensor).
-    """
-    residual = (p - q).clamp(min=0.0)
-    total = residual.sum()
-    if total < 1e-10:
-        # Degenerate: p ≤ q everywhere — sample from p directly (edge case).
-        return torch.multinomial(p.clamp(min=0.0) + 1e-10, num_samples=1).squeeze(-1)
-    residual = residual / total
-    return torch.multinomial(residual, num_samples=1).squeeze(-1)
+def proposal_length(gamma: int, remaining: int) -> int:
+    """Proposals in a round with `remaining` tokens left before the cap (>= 1)."""
+    return max(0, min(gamma, remaining - 1))
 
 
-# ── Single speculative step ────────────────────────────────────────────────────
+# ── χ² harness: 3-symbol Markov target/draft driving verify_round ─────────────
 
-def exact_speculative_step(
-    draft_model,
-    target_model,
-    input_ids: torch.Tensor,            # (1, L) current prefix
-    draft_past_kv,
-    target_past_kv,
-    gamma: int = 4,
-    temperature: float = 1.0,
-    eos_ids: set = QWEN_EOS_IDS,
-    device: str = "cuda",
-) -> Tuple[torch.Tensor, any, any, dict]:
-    """
-    One round of exact speculative decoding.
+TOY_P_START = [0.5, 0.3, 0.2]
+TOY_P = [[0.6, 0.3, 0.1], [0.2, 0.5, 0.3], [0.3, 0.2, 0.5]]
+TOY_Q_START = [0.2, 0.3, 0.5]
+TOY_Q = [[0.2, 0.4, 0.4], [0.5, 0.2, 0.3], [0.4, 0.4, 0.2]]
 
-    1. Draft proposes gamma tokens x_1, ..., x_gamma.
-    2. Target evaluates the gamma+1 continuations in one forward pass.
-    3. Accept/reject using exact sampling; on rejection draw from residual.
-    4. If all accepted, draw a bonus token from target.
-    5. Return the accepted continuation and updated caches.
 
-    Returns
-    -------
-    accepted_ids   (1, k) where 1 ≤ k ≤ gamma+1
-    draft_past_kv  updated draft KV cache (trimmed to accepted prefix)
-    target_past_kv updated target KV cache (trimmed to accepted prefix)
-    info dict:
-        n_proposed      int     gamma
-        n_accepted      int     k (accepted proposal tokens; excludes bonus)
-        bonus_token     bool    whether a bonus token was added
-        draft_probs     list[Tensor(V)] draft distributions for each proposal
-        target_probs    list[Tensor(V)] target distributions at same positions
-        accepted_tokens list[int]
-        eos_hit         bool
-    """
-    draft_model.eval()
-    target_model.eval()
+class MarkovToy:
+    """First-order Markov chains over 3 symbols; the empty prefix uses the start law."""
 
-    # ── Step 1: Draft proposal ───────────────────────────────────────────────
-    draft_tokens = []
-    draft_probs = []
-    cur_ids = input_ids  # (1, L)
-    cur_draft_kv = draft_past_kv
+    def __init__(self, p_start=TOY_P_START, P=TOY_P, q_start=TOY_Q_START, Q=TOY_Q):
+        self.p_start = torch.tensor(p_start, dtype=torch.float64)
+        self.P = torch.tensor(P, dtype=torch.float64)
+        self.q_start = torch.tensor(q_start, dtype=torch.float64)
+        self.Q = torch.tensor(Q, dtype=torch.float64)
 
-    with torch.no_grad():
+    def target(self, prefix: Sequence[int]) -> torch.Tensor:
+        return self.p_start if not prefix else self.P[prefix[-1]]
+
+    def draft(self, prefix: Sequence[int]) -> torch.Tensor:
+        return self.q_start if not prefix else self.Q[prefix[-1]]
+
+    def joint(self, seq: Sequence[int]) -> float:
+        pr, prefix = 1.0, []
+        for s in seq:
+            pr *= float(self.target(prefix)[s])
+            prefix.append(s)
+        return pr
+
+
+def toy_speculative_sequence(toy: MarkovToy, length: int, gamma: int,
+                             residual_fn: Callable = positive_residual) -> List[int]:
+    """One length-`length` sequence by speculative rounds of γ proposals each.
+    The harness always drafts γ proposals and truncates the final round's output to
+    `length` (a prefix of an exactly sampled sequence is exactly distributed), so γ=4
+    exercises full 4-proposal rounds even for length-3 sequences."""
+    seq: List[int] = []
+    while len(seq) < length:
+        props, qs, ctx = [], [], list(seq)
         for _ in range(gamma):
-            out = draft_model(cur_ids, past_key_values=cur_draft_kv, use_cache=True)
-            logits = out.logits[:, -1, :]        # (1, V)
-            cur_draft_kv = out.past_key_values
-            token, prob = _temperature_sample(logits[0], temperature)
-            draft_tokens.append(token)
-            draft_probs.append(prob)
-            cur_ids = token.view(1, 1)
-            if token.item() in eos_ids:
+            qd = toy.draft(ctx)
+            x = int(torch.multinomial(qd, 1))
+            props.append(x)
+            qs.append(qd)
+            ctx.append(x)
+        ps = torch.stack([toy.target(seq + props[:i]) for i in range(gamma + 1)])
+        res = verify_round(ps, torch.stack(qs), props, residual_fn=residual_fn)
+        seq.extend(res.tokens)
+    return seq[:length]
+
+
+def chi2_test(gamma: int, n_sequences: int = 100_000, length: int = 3, seed: int = 6304,
+              correct: bool = True, toy: Optional[MarkovToy] = None) -> dict:
+    """Pearson χ² goodness of fit of speculative sequence frequencies against the exact
+    target joint distribution over all 3^length sequences."""
+    from scipy.stats import chisquare
+    toy = toy or MarkovToy()
+    torch.manual_seed(seed)
+    res_fn = positive_residual if correct else (lambda p, q: p)
+    counts = Counter(tuple(toy_speculative_sequence(toy, length, gamma, res_fn)) for _ in range(n_sequences))
+    cats = list(itertools.product(range(3), repeat=length))
+    probs = [toy.joint(c) for c in cats]
+    expected = [pr * n_sequences for pr in probs]
+    observed = [counts.get(c, 0) for c in cats]
+    stat, pval = chisquare(observed, f_exp=expected)
+    return {"gamma": gamma, "correct_sampler": correct, "n_sequences": n_sequences, "length": length,
+            "seed": seed, "chi2": float(stat), "dof": len(cats) - 1, "p_value": float(pval),
+            "min_expected": float(min(expected)), "rejected_at_0.01": bool(pval < 0.01),
+            "table": [{"sequence": "".join(map(str, c)), "target_joint_prob": pr, "expected": e,
+                       "observed": o, "empirical_prob": o / n_sequences}
+                      for c, pr, e, o in zip(cats, probs, expected, observed)]}
+
+
+# ── real-model decoding ───────────────────────────────────────────────────────
+
+def _sync(device):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def cache_len(cache) -> int:
+    return cache.get_seq_length() if cache is not None else 0
+
+
+def forward_tokens(model, cache, tokens: Sequence[int], device, n_logits: int = 1):
+    """Append `tokens` to `cache` (positions continue from the cache length) and
+    return fp32 logits for the last `n_logits` positions, shape (n_logits, V)."""
+    ids = torch.tensor([list(tokens)], dtype=torch.long, device=device)
+    out = model(input_ids=ids, past_key_values=cache, use_cache=True, logits_to_keep=n_logits)
+    return out.logits[0].float()
+
+
+def prefill(model, prompt_ids: Sequence[int], device, chunk: Optional[int] = None):
+    """Cache of prompt_ids[:-1] (the cache invariant); chunked prefill if `chunk`."""
+    from transformers import DynamicCache
+    cache = DynamicCache()
+    body = list(prompt_ids[:-1])
+    step = chunk or max(1, len(body))
+    for s in range(0, len(body), step):
+        forward_tokens(model, cache, body[s:s + step], device)
+    return cache
+
+
+@dataclass
+class GenStats:
+    tokens: List[int] = field(default_factory=list)
+    n_rounds: int = 0                  # target verification passes (excl. prefill)
+    n_proposed: int = 0
+    n_examined: int = 0
+    n_accepted: int = 0
+    n_bonus: int = 0
+    n_draft_forwards: int = 0
+    accepted_per_round: List[int] = field(default_factory=list)
+    eos: bool = False
+    truncated: bool = False
+    t_prefill_target_ms: float = 0.0
+    t_prefill_draft_ms: float = 0.0
+    t_draft_ms: float = 0.0
+    t_verify_ms: float = 0.0
+    t_accept_ms: float = 0.0
+    t_rollback_ms: float = 0.0
+    t_total_ms: float = 0.0
+    peak_alloc_mb: Optional[float] = None
+    debug_max_logit_err: float = 0.0
+
+    def summary(self) -> dict:
+        n_out = len(self.tokens)
+        d = {k: v for k, v in self.__dict__.items() if k not in ("tokens", "accepted_per_round")}
+        decode_ms = self.t_total_ms - self.t_prefill_target_ms - self.t_prefill_draft_ms
+        phases = self.t_draft_ms + self.t_verify_ms + self.t_accept_ms + self.t_rollback_ms
+        d.update(n_output_tokens=n_out,
+                 accepted_over_examined=self.n_accepted / self.n_examined if self.n_examined else None,
+                 accepted_over_proposed=self.n_accepted / self.n_proposed if self.n_proposed else None,
+                 mean_accepted_per_verification=self.n_accepted / self.n_rounds if self.n_rounds else None,
+                 target_passes_per_output_token=self.n_rounds / n_out if n_out else None,
+                 draft_forwards_per_output_token=self.n_draft_forwards / n_out if n_out else None,
+                 t_decode_ms=decode_ms, t_host_overhead_ms=decode_ms - phases,
+                 tokens_per_s=n_out / (self.t_total_ms / 1000) if self.t_total_ms > 0 else None,
+                 accepted_per_round=self.accepted_per_round)
+        return d
+
+
+def _peak_reset(device):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _peak(device):
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated() / 2 ** 20
+    return None
+
+
+@torch.no_grad()
+def speculative_generate(target, draft, prompt_ids: Sequence[int], max_new_tokens: int, gamma: int,
+                         eos_ids=QWEN_EOS_IDS, device="cuda", debug_check: bool = False,
+                         prefill_chunk: Optional[int] = None) -> GenStats:
+    """Exact speculative sampling with the cache discipline in the module docstring.
+    Per-round phase timers are CUDA-synchronised.  debug_check=True (tests) compares
+    every verification against a fresh full forward and asserts the cache invariant."""
+    assert len(prompt_ids) >= 1 and max_new_tokens >= 1 and gamma >= 1
+    st = GenStats()
+    _peak_reset(device)
+    _sync(device)
+    t_start = time.perf_counter()
+    tc = prefill(target, prompt_ids, device, prefill_chunk)
+    _sync(device)
+    t1 = time.perf_counter()
+    st.t_prefill_target_ms = 1000 * (t1 - t_start)
+    dc = prefill(draft, prompt_ids, device, prefill_chunk)
+    _sync(device)
+    st.t_prefill_draft_ms = 1000 * (time.perf_counter() - t1)
+    committed = list(prompt_ids)
+    while len(st.tokens) < max_new_tokens:
+        n_max = proposal_length(gamma, max_new_tokens - len(st.tokens))
+        # draft proposals
+        t0 = time.perf_counter()
+        feed = committed[cache_len(dc):]
+        props, qs = [], []
+        for _ in range(n_max):
+            q = torch.softmax(forward_tokens(draft, dc, feed, device)[-1], dim=-1)
+            st.n_draft_forwards += 1
+            x = int(torch.multinomial(q, 1))
+            props.append(x)
+            qs.append(q)
+            feed = [x]
+            if x in eos_ids:
                 break
-
-    n_proposed = len(draft_tokens)
-
-    # ── Step 2: Target evaluation on full proposed sequence ──────────────────
-    proposal_ids = torch.tensor(
-        [t.item() for t in draft_tokens], dtype=torch.long, device=device
-    ).unsqueeze(0)  # (1, gamma)
-
-    # Run target on [input_ids, proposal] in one pass.
-    full_ids = torch.cat([input_ids, proposal_ids], dim=1)  # (1, L + gamma)
-    with torch.no_grad():
-        target_out = target_model(full_ids, past_key_values=target_past_kv, use_cache=True)
-    target_logits = target_out.logits[0]   # (L+gamma, V)
-    target_new_kv = target_out.past_key_values
-
-    # Target probs at positions corresponding to draft proposals.
-    # logit at position (L-1 + i) predicts the i-th draft token (0-indexed).
-    orig_L = input_ids.shape[1]
-    target_probs = []
-    for i in range(n_proposed):
-        logit_pos = orig_L - 1 + i   # logit at L-1+i predicts token at L+i
-        p_i = F.softmax(target_logits[logit_pos].float(), dim=-1)
-        target_probs.append(p_i)
-
-    # ── Step 3: Accept/reject ────────────────────────────────────────────────
-    accepted_tokens = []
-    n_accepted = 0
-
-    for i in range(n_proposed):
-        x_i = draft_tokens[i].item()
-        p_i = target_probs[i]
-        q_i = draft_probs[i]
-
-        ratio = (p_i[x_i] / (q_i[x_i] + 1e-10)).clamp(max=1.0).item()
-        u = torch.rand(1).item()
-
-        if u <= ratio:
-            # Accept.
-            accepted_tokens.append(x_i)
-            n_accepted += 1
-            if x_i in eos_ids:
-                break
-        else:
-            # Reject: sample from positive residual.
-            residual_token = _residual_sample(p_i, q_i).item()
-            accepted_tokens.append(residual_token)
+        _sync(device)
+        t1 = time.perf_counter()
+        # one target verification pass over [uncached committed tokens] + proposals
+        t_feed = committed[cache_len(tc):] + props
+        logits = forward_tokens(target, tc, t_feed, device, n_logits=len(props) + 1)
+        _sync(device)
+        t2 = time.perf_counter()
+        if debug_check:
+            full = target(input_ids=torch.tensor([committed + props], device=device)).logits[0].float()
+            ref = full[len(committed) - 1:]
+            st.debug_max_logit_err = max(st.debug_max_logit_err, float((ref - logits).abs().max()))
+        p = torch.softmax(logits, dim=-1)
+        res = verify_round(p, torch.stack(qs) if qs else p[:0], props, eos_ids)
+        _sync(device)
+        t3 = time.perf_counter()
+        st.tokens.extend(res.tokens)
+        committed.extend(res.tokens)
+        keep = len(committed) - 1
+        tc.crop(keep)
+        if cache_len(dc) > keep:
+            dc.crop(keep)
+        _sync(device)
+        t4 = time.perf_counter()
+        if debug_check:
+            assert cache_len(tc) == keep, (cache_len(tc), keep)
+            assert keep - 1 <= cache_len(dc) <= keep, (cache_len(dc), keep)
+        st.n_rounds += 1
+        st.n_proposed += res.n_proposed
+        st.n_examined += res.n_examined
+        st.n_accepted += res.n_accepted
+        st.n_bonus += int(res.bonus)
+        st.accepted_per_round.append(res.n_accepted)
+        st.t_draft_ms += 1000 * (t1 - t0)
+        st.t_verify_ms += 1000 * (t2 - t1)
+        st.t_accept_ms += 1000 * (t3 - t2)
+        st.t_rollback_ms += 1000 * (t4 - t3)
+        if res.eos:
+            st.eos = True
             break
-
-    bonus_token = False
-    if n_accepted == n_proposed and n_proposed > 0 and not (draft_tokens[-1].item() in eos_ids):
-        # All proposals accepted: draw bonus token from target.
-        bonus_logit_pos = orig_L - 1 + n_proposed
-        if bonus_logit_pos < target_logits.shape[0]:
-            p_bonus = F.softmax(target_logits[bonus_logit_pos].float(), dim=-1)
-            bonus = torch.multinomial(p_bonus, num_samples=1).item()
-            accepted_tokens.append(bonus)
-            bonus_token = True
-
-    # ── Step 4: Cache rollback ───────────────────────────────────────────────
-    # Keep target cache up to accepted prefix length.
-    k = len(accepted_tokens)  # actual new tokens
-    # Trim target cache: it was extended to L+gamma; keep L+k.
-    target_past_kv = _trim_kv_cache(target_new_kv, orig_L + k)
-
-    # Rebuild draft cache: advance draft model from input_ids to accepted prefix.
-    with torch.no_grad():
-        accepted_ids_tensor = torch.tensor(
-            accepted_tokens[:n_accepted if not bonus_token else n_accepted + 1],
-            dtype=torch.long, device=device
-        ).unsqueeze(0)
-        # We need to run draft forward on accepted tokens to sync its cache.
-        # For the draft cache, only the first n_accepted tokens were from draft proposals.
-        # Roll back draft cache to input length, then advance.
-        draft_past_kv = _trim_kv_cache(cur_draft_kv, orig_L + n_accepted)
-
-    accepted_tensor = torch.tensor(accepted_tokens, dtype=torch.long, device=device).unsqueeze(0)
-    eos_hit = any(t in eos_ids for t in accepted_tokens)
-
-    return accepted_tensor, draft_past_kv, target_past_kv, {
-        "n_proposed": n_proposed,
-        "n_accepted": n_accepted,
-        "bonus_token": bonus_token,
-        "draft_probs": [p.cpu() for p in draft_probs],
-        "target_probs": [p.cpu() for p in target_probs],
-        "accepted_tokens": accepted_tokens,
-        "eos_hit": eos_hit,
-    }
+    assert len(st.tokens) <= max_new_tokens
+    st.truncated = not st.eos and len(st.tokens) >= max_new_tokens
+    _sync(device)
+    st.t_total_ms = 1000 * (time.perf_counter() - t_start)
+    st.peak_alloc_mb = _peak(device)
+    return st
 
 
-def _trim_kv_cache(past_kv, seq_len: int):
-    """Trim a transformers KV cache to `seq_len` positions."""
-    if past_kv is None:
-        return None
-    try:
-        from transformers import DynamicCache
-        if isinstance(past_kv, DynamicCache):
-            new_cache = DynamicCache()
-            for layer_idx in range(len(past_kv.key_cache)):
-                K = past_kv.key_cache[layer_idx][:, :, :seq_len, :]
-                V = past_kv.value_cache[layer_idx][:, :, :seq_len, :]
-                new_cache.update(K, V, layer_idx)
-            return new_cache
-    except ImportError:
-        pass
-    # Fallback for tuple-of-tuple format.
-    return tuple(
-        (layer[0][:, :, :seq_len, :], layer[1][:, :, :seq_len, :])
-        for layer in past_kv
-    )
-
-
-# ── Full generation loop ───────────────────────────────────────────────────────
-
-def exact_speculative_generate(
-    draft_model,
-    target_model,
-    prompt_ids: torch.Tensor,            # (1, prompt_len)
-    max_new_tokens: int = 64,
-    gamma: int = 4,
-    temperature: float = 1.0,
-    eos_ids: set = QWEN_EOS_IDS,
-    device: str = "cuda",
-) -> Tuple[List[int], dict]:
-    """
-    Generate max_new_tokens using exact speculative decoding.
-
-    Returns (generated_token_ids, stats_dict).
-    stats_dict aggregates per-round info: acceptance counts, timings, etc.
-    """
-    generated = []
-    cur_ids = prompt_ids.to(device)
-    draft_past_kv = None
-    target_past_kv = None
-    total_proposed = 0
-    total_accepted = 0
-    total_target_calls = 0
-
-    # Warm up caches with a prefill pass.
-    with torch.no_grad():
-        d_out = draft_model(cur_ids, use_cache=True)
-        draft_past_kv = d_out.past_key_values
-        t_out = target_model(cur_ids, use_cache=True)
-        target_past_kv = t_out.past_key_values
-
-    while len(generated) < max_new_tokens:
-        remaining = max_new_tokens - len(generated)
-        g = min(gamma, remaining)
-
-        accepted, draft_past_kv, target_past_kv, info = exact_speculative_step(
-            draft_model, target_model, cur_ids,
-            draft_past_kv, target_past_kv,
-            gamma=g, temperature=temperature, eos_ids=eos_ids, device=device,
-        )
-
-        new_tokens = accepted[0].tolist()
-        generated.extend(new_tokens)
-        cur_ids = accepted[:, -1:]  # feed last accepted token
-
-        total_proposed += info["n_proposed"]
-        total_accepted += info["n_accepted"]
-        total_target_calls += 1
-
-        if info["eos_hit"] or len(generated) >= max_new_tokens:
+@torch.no_grad()
+def target_only_generate(model, prompt_ids: Sequence[int], max_new_tokens: int, eos_ids=QWEN_EOS_IDS,
+                         device="cuda", prefill_chunk: Optional[int] = None) -> GenStats:
+    """Same-condition reference: one target forward per token, same cache discipline,
+    full-softmax temperature-1 sampling.  t_verify_ms = per-token target forwards."""
+    st = GenStats()
+    _peak_reset(device)
+    _sync(device)
+    t_start = time.perf_counter()
+    cache = prefill(model, prompt_ids, device, prefill_chunk)
+    _sync(device)
+    st.t_prefill_target_ms = 1000 * (time.perf_counter() - t_start)
+    committed = list(prompt_ids)
+    while len(st.tokens) < max_new_tokens:
+        t1 = time.perf_counter()
+        logits = forward_tokens(model, cache, committed[cache_len(cache):], device)
+        _sync(device)
+        t2 = time.perf_counter()
+        y = int(torch.multinomial(torch.softmax(logits[-1], dim=-1), 1))
+        _sync(device)
+        st.t_verify_ms += 1000 * (t2 - t1)
+        st.t_accept_ms += 1000 * (time.perf_counter() - t2)
+        st.tokens.append(y)
+        committed.append(y)
+        st.n_rounds += 1
+        if y in eos_ids:
+            st.eos = True
             break
-
-    return generated[:max_new_tokens], {
-        "total_proposed": total_proposed,
-        "total_accepted": total_accepted,
-        "total_target_calls": total_target_calls,
-        "acceptance_rate": total_accepted / total_proposed if total_proposed else 0.0,
-    }
-
-
-# ── Statistical correctness test ───────────────────────────────────────────────
-
-class SpeculativeSampler:
-    """
-    Wrapper for running the χ² goodness-of-fit distributional correctness test.
-    """
-
-    @staticmethod
-    def _make_markov(
-        n_symbols: int,
-        seed: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Create a small Markov target and draft for the correctness test.
-
-        Returns (target_trans, draft_trans):
-          Each is a (n_symbols, n_symbols) transition matrix (rows = distributions).
-        """
-        rng = torch.Generator()
-        rng.manual_seed(seed)
-        t = torch.rand(n_symbols, n_symbols, generator=rng)
-        t = t / t.sum(dim=1, keepdim=True)   # row-stochastic
-        d = torch.rand(n_symbols, n_symbols, generator=rng)
-        d = d / d.sum(dim=1, keepdim=True)
-        return t, d
-
-    @staticmethod
-    def _spec_step_markov(
-        state: int,
-        target_trans: torch.Tensor,
-        draft_trans: torch.Tensor,
-        gamma: int = 1,
-        correct: bool = True,
-    ) -> Tuple[int, int]:
-        """
-        One round of speculative sampling on a Markov model.
-        correct=True  uses positive residual (correct).
-        correct=False replaces residual with p (incorrect — must be rejected by test).
-        Returns (accepted_len, next_state).
-        """
-        p = target_trans[state]
-        q = draft_trans[state]
-
-        # Draft proposal.
-        x = torch.multinomial(q, 1).item()
-
-        ratio = (p[x] / (q[x] + 1e-10)).clamp(max=1.0).item()
-        u = torch.rand(1).item()
-
-        if u <= ratio:
-            return 1, x
-        else:
-            if correct:
-                residual = (p - q).clamp(min=0.0)
-                s = residual.sum().item()
-                if s < 1e-10:
-                    residual = p.clamp(min=0.0)
-                residual = residual / (residual.sum() + 1e-10)
-                y = torch.multinomial(residual, 1).item()
-            else:
-                # Incorrect: sample from p instead of residual.
-                y = torch.multinomial(p, 1).item()
-            return 0, y
-
-    @classmethod
-    def run_chi2_test(
-        cls,
-        n_symbols: int = 3,
-        seq_len: int = 3,
-        n_trials: int = 100_000,
-        seed: int = 6304,
-        correct: bool = True,
-        gamma: int = 1,
-    ) -> dict:
-        """
-        Test that the speculative sampler reproduces the target distribution
-        over joint sequences of length `seq_len`.
-
-        Requirement from PDF:
-          - Correct sampler: p-value > 0.01 (do NOT reject at p<0.01).
-          - Incorrect sampler: p-value < 0.01 (MUST reject at p<0.01).
-          - All expected category counts ≥ 10.
-
-        Returns dict with p_value, chi2_stat, dof, expected_counts, observed_counts.
-        """
-        torch.manual_seed(seed)
-        target_trans, draft_trans = cls._make_markov(n_symbols, seed)
-
-        # Compute exact joint probabilities under the TARGET chain.
-        # Stationary distribution (uniform start for simplicity).
-        init = torch.ones(n_symbols) / n_symbols
-        # Joint prob of sequence (s0, s1, s2, ...): p(s0) * prod p(s_{i+1}|s_i).
-        # For seq_len=3 we have n_symbols^3 sequences.
-        joint_expected = {}
-        for s0 in range(n_symbols):
-            for s1 in range(n_symbols):
-                for s2 in range(n_symbols):
-                    prob = (
-                        init[s0].item()
-                        * target_trans[s0, s1].item()
-                        * target_trans[s1, s2].item()
-                    )
-                    joint_expected[(s0, s1, s2)] = prob
-
-        # Simulate speculative sampler.
-        from collections import Counter
-        observed = Counter()
-        for _ in range(n_trials):
-            seq = []
-            state = torch.multinomial(init, 1).item()
-            seq.append(state)
-            for _ in range(seq_len - 1):
-                _, state = cls._spec_step_markov(
-                    state, target_trans, draft_trans, gamma=gamma, correct=correct
-                )
-                seq.append(state)
-            observed[tuple(seq)] += 1
-
-        # Build parallel arrays for chi2 test.
-        all_seqs = list(joint_expected.keys())
-        expected_counts = np.array([joint_expected[s] * n_trials for s in all_seqs])
-        observed_counts = np.array([observed.get(s, 0) for s in all_seqs])
-
-        # Check all expected ≥ 10.
-        min_expected = expected_counts.min()
-        chi2_stat, p_value = chisquare(observed_counts, f_exp=expected_counts)
-
-        return {
-            "correct": correct,
-            "chi2_stat": float(chi2_stat),
-            "p_value": float(p_value),
-            "min_expected_count": float(min_expected),
-            "rejects_at_0_01": p_value < 0.01,
-            "n_trials": n_trials,
-            "n_symbols": n_symbols,
-            "seq_len": seq_len,
-        }
+    st.truncated = not st.eos and len(st.tokens) >= max_new_tokens
+    _sync(device)
+    st.t_total_ms = 1000 * (time.perf_counter() - t_start)
+    st.peak_alloc_mb = _peak(device)
+    return st

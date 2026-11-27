@@ -1,376 +1,309 @@
 """
-Policy distillation: off-policy and on-policy (PDF §3 steps 3–4).
+Policy distillation: off-policy and on-policy LoRA students (PDF §3 steps 3-4).
 
-Shared settings:
-  - Teacher: Qwen/Qwen2.5-1.5B-Instruct (frozen)
-  - Student: Qwen/Qwen2.5-0.5B-Instruct + LoRA adapters on q/k/v/o_proj
-  - LoRA: r=8, alpha=16, dropout=0, targets q_proj k_proj v_proj o_proj
-  - Optimizer: AdamW LR 3e-4, weight_decay 0.01
-  - Precision: FP16 frozen backbone, FP32 adapters + optimizer states
-  - Gradient clipping: global norm 1.0 (normalize KL by supervised tokens per update)
-  - Token quota: 40,000 teacher-scored tokens per seed (30k math + 10k short)
-  - Response caps: 192 math, 32 short; temperature=1.0, top_p=1.0
-  - Microbatch 1; one update per 256 teacher-scored tokens (short final update OK)
-  - Sampling: temperature=1, top_p=1, repetition_penalty=1.0
-  - EOS IDs: {151645, 151643} for Qwen2.5-Instruct
+Fixed settings (PDF table, p.13):
+  seeds 6304, 6305 x {off-policy, on-policy}, each from the ORIGINAL 0.5B checkpoint;
+  quota 40,000 teacher-scored response tokens per run = 30,000 math + 10,000 short;
+  caps 192 math / 32 short; temperature 1, top-p 1 (top-k 0, repetition penalty 1);
+  microbatch 1; one optimizer update per 256 teacher-scored tokens (final update may be
+  shorter); AdamW lr 3e-4 (constant), weight decay 0.01; FP16 frozen backbone, FP32 LoRA
+  parameters and optimizer state, FP16 autocast + dynamic GradScaler, unscale before
+  clipping at global norm 1.0; LoRA r=8, alpha=16, dropout 0 on q/k/v/o_proj.
 
-Distillation objective (both methods):
-  L_KD(phi; H) = (1/|H|) * sum_{h in H} KL(p_T(·|h) || q_phi(·|h))
-  where H is the set of supervised response PREFIXES and KL is over the full vocab.
-  Forward KL from teacher to student — do NOT use the sampled token as a hard label.
+Objective (both methods): forward token KL(p_T(.|h) || q_phi(.|h)) over the full common
+vocabulary at every supervised response prefix h, SUMMED over the update's supervised
+tokens and divided by their number (exactly 256, or fewer for the final update) — so
+the loss is the mean per-token KL of the update.  The sampled token is never a target.
+
+Exact update boundaries: a response that crosses a 256-token boundary is split; the
+tokens after the boundary are scored by a fresh student forward AFTER the optimizer step
+(teacher log-probs of the response are computed once).  A response that would exceed
+its category quota is truncated to the permitted prefix and the truncation recorded.
+
+Prompt schedule: within each category a fixed seeded permutation is cycled round-robin
+(prompts are reused after exhausting a category).  The next presentation comes from the
+category with the smaller filled fraction of its quota (ties -> math).
+Off-policy: a FROZEN teacher pool (`build_teacher_pool`: 1 rollout per math prompt, 8 per
+short prompt, made once before training and shared by both seeds); visit v of prompt p
+presents rollout v mod R_p.  On-policy: a fresh rollout from the CURRENT student (no
+gradient), rollout seed recorded.
+
+Logged per presentation: source id, category, visit, rollout seed, response token ids,
+termination reason, response length, teacher-scored tokens, quota truncation.  Costs are
+timed separately: teacher generation (pool), teacher scoring, student rollout, student
+forward/backward, optimizer steps (merging is timed in merge.py).
 """
 
+import hashlib
 import json
 import random
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
-from peft import LoraConfig, get_peft_model, TaskType
 
+from common.runio import read_jsonl, write_json, write_jsonl
+from .generation import MATH_CAP, SHORT_CAP, chat_ids, sample_batch, sample_one
+from .speculative import QWEN_EOS_IDS
 
 MATH_QUOTA = 30_000
 SHORT_QUOTA = 10_000
+QUOTA = {"math": MATH_QUOTA, "short": SHORT_QUOTA}
 TOTAL_QUOTA = MATH_QUOTA + SHORT_QUOTA
 TOKENS_PER_UPDATE = 256
-MATH_CAP = 192
-SHORT_CAP = 32
-TEMPERATURE = 1.0
-TOP_P = 1.0
-REPET_PENALTY = 1.0
-EOS_IDS = {151645, 151643}
-
-LORA_CONFIG = dict(r=8, lora_alpha=16, lora_dropout=0.0,
-                   target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                   bias="none", task_type=TaskType.CAUSAL_LM)
+CAP = {"math": MATH_CAP, "short": SHORT_CAP}
+LR = 3e-4
+WEIGHT_DECAY = 0.01
+GRAD_CLIP = 1.0
+SEEDS = (6304, 6305)
+POOL_ROLLOUTS = {"math": 1, "short": 8}
+LORA = dict(r=8, lora_alpha=16, lora_dropout=0.0, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            bias="none")
 
 
-def _build_lora_student(student_base_model) -> any:
-    cfg = LoraConfig(**LORA_CONFIG)
-    return get_peft_model(student_base_model, cfg)
+def _h(*parts) -> int:
+    return int.from_bytes(hashlib.sha256("|".join(map(str, parts)).encode()).digest()[:4], "big")
 
 
-def _teacher_generate(
-    teacher_model,
-    tokenizer,
-    prompt_ids: torch.Tensor,
-    max_new: int,
-    device: str,
-    seed: int,
-) -> List[int]:
-    """Generate a response from the teacher at temperature=1, top_p=1."""
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-    with torch.no_grad():
-        out = teacher_model.generate(
-            prompt_ids.to(device),
-            max_new_tokens=max_new,
-            do_sample=True,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            repetition_penalty=REPET_PENALTY,
-            eos_token_id=list(EOS_IDS),
-            use_cache=True,
-        )
-    return out[0, prompt_ids.shape[1]:].tolist()
+def _sync(dev):
+    if str(dev).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
-def _kl_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
-    """
-    Forward KL(teacher || student) averaged over supervised token positions.
-    Both tensors: (n_tokens, vocab_size), fp32.
-    """
-    p_t = F.softmax(teacher_logits, dim=-1)
-    log_q = F.log_softmax(student_logits, dim=-1)
-    return F.kl_div(log_q, p_t, reduction="batchmean")
+class PromptSchedule:
+    """Seeded round-robin permutation within each category; reuse after exhaustion."""
+
+    def __init__(self, prompts: Dict[str, List[dict]], seed: int):
+        self.order = {}
+        for c in ("math", "short"):
+            perm = list(prompts[c])
+            random.Random(f"PA4-T3-schedule:{seed}:{c}").shuffle(perm)
+            self.order[c] = perm
+        self.pos = {"math": 0, "short": 0}
+        self.visits: Dict[str, int] = {}
+
+    def next(self, category: str):
+        L = self.order[category]
+        p = L[self.pos[category] % len(L)]
+        self.pos[category] += 1
+        v = self.visits.get(p["id"], 0)
+        self.visits[p["id"]] = v + 1
+        return p, v
 
 
-def _make_optimizer(student_model) -> AdamW:
-    return AdamW(
-        [p for p in student_model.parameters() if p.requires_grad],
-        lr=3e-4,
-        weight_decay=0.01,
-    )
+def next_category(scored: Dict[str, int], quota: Dict[str, int] = QUOTA) -> Optional[str]:
+    """Category with the smaller filled fraction of its quota (ties -> math); None when full."""
+    open_ = [c for c in ("math", "short") if scored[c] < quota.get(c, 0)]
+    if not open_:
+        return None
+    return min(open_, key=lambda c: (scored[c] / quota[c], c != "math"))
 
 
-# ── Off-policy distillation ────────────────────────────────────────────────────
+# ── teacher pool (off-policy) ─────────────────────────────────────────────────
 
-def offpolicy_distill(
-    teacher_model,
-    student_base_model,
-    tokenizer,
-    math_prompts: List[dict],     # {"id": str, "text": str, "category": "math"}
-    short_prompts: List[dict],    # {"id": str, "text": str, "category": "short"}
-    seed: int = 6304,
-    device: str = "cuda",
-    result_dir: str = "results/task3",
-) -> dict:
-    """
-    Off-policy distillation.
+def build_teacher_pool(teacher, tokenizer, prompts: Dict[str, List[dict]], out_path: str, device="cuda",
+                       batch_size: int = 32, seed: int = 6304, log=print) -> dict:
+    """Frozen teacher rollouts for every training prompt (R_math=1, R_short=8), batched.
+    Rollout seed of a batch = hash(seed, category, batch index); torch.manual_seed."""
+    rows = []
+    t0 = time.perf_counter()
+    for c in ("math", "short"):
+        items = [(p, r) for p in prompts[c] for r in range(POOL_ROLLOUTS[c])]
+        for b in range(0, len(items), batch_size):
+            chunk = items[b:b + batch_size]
+            bseed = _h("PA4-T3-pool", seed, c, b)
+            torch.manual_seed(bseed)
+            outs = sample_batch(teacher, [chat_ids(tokenizer, p["text"]) for p, _ in chunk], CAP[c],
+                                device=device)
+            for j, ((p, r), o) in enumerate(zip(chunk, outs)):
+                rows.append({"source_id": p["id"], "category": c, "rollout": r, "rollout_seed": bseed,
+                             "batch_row": j, "response_ids": o["tokens"], "termination": o["termination"],
+                             "n_tokens": len(o["tokens"])})
+            log(f"[pool] {c} {min(b + batch_size, len(items))}/{len(items)}")
+    _sync(device)
+    secs = time.perf_counter() - t0
+    write_jsonl(out_path, rows)
+    meta = {"n_rollouts": len(rows), "teacher_generation_seconds": secs, "rollouts_per_prompt": POOL_ROLLOUTS,
+            "tokens": {c: sum(r["n_tokens"] for r in rows if r["category"] == c) for c in ("math", "short")},
+            "eos_rate": {c: sum(r["termination"] == "eos" for r in rows if r["category"] == c) /
+                         max(1, sum(r["category"] == c for r in rows)) for c in ("math", "short")}}
+    return meta
 
-    1. Prepare a FROZEN teacher-response pool from training prompts.
-    2. Cycle through the pool deterministically up to the token quota.
-    3. For each teacher response prefix, compute KL loss and update student.
 
-    Records teacher rollout cost and training cost separately.
-    """
-    rng = random.Random(seed)
-    result_path = Path(result_dir) / f"offpolicy_seed{seed}"
-    result_path.mkdir(parents=True, exist_ok=True)
+def load_pool(path: str) -> Dict[tuple, dict]:
+    return {(r["source_id"], r["rollout"]): r for r in read_jsonl(path)}
 
-    student_model = _build_lora_student(student_base_model)
-    student_model.to(device)
-    # Frozen backbone in FP16; adapters in FP32.
-    for name, param in student_model.named_parameters():
-        if "lora_" in name:
-            param.data = param.data.float()
+
+# ── student ───────────────────────────────────────────────────────────────────
+
+def make_lora_student(base_model):
+    """LoRA on the frozen FP16 backbone; adapter parameters in FP32."""
+    from peft import LoraConfig, TaskType, get_peft_model
+    model = get_peft_model(base_model, LoraConfig(task_type=TaskType.CAUSAL_LM, **LORA))
+    for n, p in model.named_parameters():
+        if "lora_" in n:
+            p.data = p.data.float()
+            p.requires_grad_(True)
         else:
-            param.requires_grad_(False)
-
-    optimizer = _make_optimizer(student_model)
-    scaler = torch.cuda.amp.GradScaler()
-
-    # Build 800-prompt pool: 500 math + 300 short, round-robin permuted.
-    pool = _build_prompt_pool(math_prompts, short_prompts, seed)
-
-    # Step 1: collect frozen teacher responses.
-    teacher_pool = _collect_teacher_responses(teacher_model, tokenizer, pool, seed, device)
-    teacher_pool_path = result_path / "teacher_pool.json"
-    with open(teacher_pool_path, "w") as fh:
-        json.dump([{k: v for k, v in r.items() if k != "token_ids"} for r in teacher_pool], fh, indent=2)
-
-    # Step 2: train.
-    curves = {"step": [], "loss": [], "lr": [], "scored_tokens": []}
-    scored_tokens = 0
-    update_buffer_tokens = 0
-    update_buffer_logits = []  # (teacher_logits, student_logits) pairs
-    optimizer_step = 0
-    skipped_updates = 0
-
-    pool_idx = 0
-    while scored_tokens < TOTAL_QUOTA:
-        rec = teacher_pool[pool_idx % len(teacher_pool)]
-        pool_idx += 1
-        prefix_ids = torch.tensor([rec["prefix_ids"]], dtype=torch.long, device=device)
-        t_logits = torch.tensor(rec["teacher_logits"], dtype=torch.float32, device=device)
-
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            s_out = student_model(prefix_ids)
-        s_logits = s_out.logits[0, :-1, :].float()  # predict next tokens
-        t_logits_ = t_logits[:s_logits.shape[0], :]  # align lengths
-
-        n_tokens = s_logits.shape[0]
-        update_buffer_logits.append((t_logits_.detach(), s_logits))
-        update_buffer_tokens += n_tokens
-        scored_tokens += n_tokens
-
-        if update_buffer_tokens >= TOKENS_PER_UPDATE or scored_tokens >= TOTAL_QUOTA:
-            cat_t = torch.cat([x[0] for x in update_buffer_logits], dim=0)
-            cat_s = torch.cat([x[1] for x in update_buffer_logits], dim=0)
-            loss = _kl_loss(cat_s, cat_t)
-            # Normalize by supervised tokens in this update.
-            loss = loss / (update_buffer_tokens + 1e-8) * TOKENS_PER_UPDATE
-
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in student_model.parameters() if p.requires_grad], 1.0
-            )
-            if torch.isfinite(torch.tensor(grad_norm.item())):
-                scaler.step(optimizer)
-                optimizer_step += 1
-            else:
-                skipped_updates += 1
-            scaler.update()
-
-            curves["step"].append(optimizer_step)
-            curves["loss"].append(loss.item())
-            curves["scored_tokens"].append(scored_tokens)
-            update_buffer_logits = []
-            update_buffer_tokens = 0
-
-    with open(result_path / "curves.json", "w") as fh:
-        json.dump({**curves, "skipped_updates": skipped_updates, "total_scored_tokens": scored_tokens}, fh, indent=2)
-
-    return {"model": student_model, "curves": curves, "result_dir": str(result_path)}
+            p.requires_grad_(False)
+    return model
 
 
-def onpolicy_distill(
-    teacher_model,
-    student_base_model,
-    tokenizer,
-    math_prompts: List[dict],
-    short_prompts: List[dict],
-    seed: int = 6304,
-    device: str = "cuda",
-    result_dir: str = "results/task3",
-) -> dict:
-    """
-    On-policy distillation.
+def param_counts(model) -> dict:
+    tot = sum(p.numel() for p in model.parameters())
+    tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return {"total_params": tot, "trainable_adapter_params": tr, "backbone_params": tot - tr}
 
-    For each training step, generate a fresh response PREFIX from the CURRENT STUDENT,
-    compute the TEACHER's distribution at those prefixes, and minimise KL(teacher||student).
 
-    Generation cost is logged separately and not differentiated through.
-    """
-    rng = random.Random(seed)
-    result_path = Path(result_dir) / f"onpolicy_seed{seed}"
-    result_path.mkdir(parents=True, exist_ok=True)
+def _response_logprobs(model, prompt_ids: List[int], resp: List[int], start: int, end: int, device):
+    """log-probs (end-start, V) fp32 for response tokens [start, end) given prompt+resp[:i]."""
+    ids = torch.tensor([prompt_ids + resp[:end]], device=device)
+    out = model(input_ids=ids, use_cache=False, logits_to_keep=end - start + 1)
+    return F.log_softmax(out.logits[0, :-1].float(), dim=-1)
 
-    student_model = _build_lora_student(student_base_model)
-    student_model.to(device)
-    for name, param in student_model.named_parameters():
-        if "lora_" in name:
-            param.data = param.data.float()
+
+def kl_sum(teacher_logp: torch.Tensor, student_logp: torch.Tensor) -> torch.Tensor:
+    """sum over rows of KL(p_T || q) = sum p_T (log p_T - log q)."""
+    return (teacher_logp.exp() * (teacher_logp - student_logp)).sum()
+
+
+def distill(method: str, teacher, student_base, tokenizer, prompts: Dict[str, List[dict]], seed: int,
+            out_dir: str, device="cuda", pool: Optional[Dict[tuple, dict]] = None,
+            pool_meta: Optional[dict] = None, quota: Optional[Dict[str, int]] = None,
+            tokens_per_update: int = TOKENS_PER_UPDATE, log=print) -> dict:
+    """Run one distillation (method 'off' or 'on'). Writes curves.json,
+    presentations.jsonl.gz, adapter/ and summary.json (last) to out_dir."""
+    assert method in ("off", "on")
+    if method == "off":
+        assert pool is not None, "off-policy needs the frozen teacher pool"
+    quota = dict(quota or QUOTA)
+    total_quota = sum(quota.values())
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(seed)
+    student = make_lora_student(student_base)
+    counts = param_counts(student)
+    opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=LR,
+                            weight_decay=WEIGHT_DECAY)
+    scaler = torch.amp.GradScaler("cuda", enabled=str(device).startswith("cuda"))
+    sched = PromptSchedule(prompts, seed)
+    teacher.eval()
+    scored = {"math": 0, "short": 0}
+    pres, curves = [], []
+    cost = {"teacher_scoring_s": 0.0, "student_rollout_s": 0.0, "student_fwd_bwd_s": 0.0, "optimizer_s": 0.0}
+    upd = {"n": 0, "target": min(tokens_per_update, total_quota), "loss_sum": 0.0, "by_cat": {"math": 0, "short": 0}}
+    stats = {"updates": 0, "skipped_updates": 0, "skipped_at": [], "truncated_by_quota": 0}
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    t_run = time.perf_counter()
+    k = 0
+    ac = (lambda: torch.autocast("cuda", dtype=torch.float16)) if str(device).startswith("cuda") else \
+        (lambda: torch.autocast("cpu", enabled=False))
+    while True:
+        cat = next_category(scored, quota)
+        if cat is None:
+            break
+        p, visit = sched.next(cat)
+        pids = chat_ids(tokenizer, p["text"])
+        if method == "off":
+            r = pool[(p["id"], visit % POOL_ROLLOUTS[cat])]
+            resp, term, rseed = list(r["response_ids"]), r["termination"], r["rollout_seed"]
         else:
-            param.requires_grad_(False)
-
-    optimizer = _make_optimizer(student_model)
-    scaler = torch.cuda.amp.GradScaler()
-
-    pool = _build_prompt_pool(math_prompts, short_prompts, seed)
-    curves = {"step": [], "loss": [], "scored_tokens": [], "rollout_tokens": []}
-    scored_tokens = 0
-    update_buffer_tokens = 0
-    update_buffer_logits = []
-    optimizer_step = 0
-    skipped_updates = 0
-    total_rollout_tokens = 0
-
-    pool_idx = 0
-    while scored_tokens < TOTAL_QUOTA:
-        rec = pool[pool_idx % len(pool)]
-        pool_idx += 1
-        is_math = rec["category"] == "math"
-        cap = MATH_CAP if is_math else SHORT_CAP
-
-        prompt_ids = tokenizer(rec["text"], return_tensors="pt")["input_ids"].to(device)
-        gen_seed = seed + pool_idx
-
-        # Generate from current student.
-        student_model.eval()
-        with torch.no_grad():
-            gen_out = student_model.generate(
-                prompt_ids,
-                max_new_tokens=cap,
-                do_sample=True,
-                temperature=TEMPERATURE,
-                top_p=TOP_P,
-                repetition_penalty=REPET_PENALTY,
-                eos_token_id=list(EOS_IDS),
-                use_cache=True,
-            )
-        response_ids = gen_out[0, prompt_ids.shape[1]:]
-        total_rollout_tokens += response_ids.shape[0]
-
-        # Score with teacher and student.
-        full_ids = gen_out  # (1, prompt + response)
-        with torch.no_grad():
-            t_out = teacher_model(full_ids)
-        t_logits = t_out.logits[0, prompt_ids.shape[1] - 1: -1, :].float()
-
-        student_model.train()
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            s_out = student_model(full_ids)
-        s_logits = s_out.logits[0, prompt_ids.shape[1] - 1: -1, :].float()
-
-        n_tokens = s_logits.shape[0]
-        update_buffer_logits.append((t_logits.detach(), s_logits))
-        update_buffer_tokens += n_tokens
-        scored_tokens += n_tokens
-
-        if update_buffer_tokens >= TOKENS_PER_UPDATE or scored_tokens >= TOTAL_QUOTA:
-            cat_t = torch.cat([x[0] for x in update_buffer_logits], dim=0)
-            cat_s = torch.cat([x[1] for x in update_buffer_logits], dim=0)
-            loss = _kl_loss(cat_s, cat_t)
-            loss = loss / (update_buffer_tokens + 1e-8) * TOKENS_PER_UPDATE
-
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in student_model.parameters() if p.requires_grad], 1.0
-            )
-            if torch.isfinite(torch.tensor(grad_norm.item())):
-                scaler.step(optimizer)
-                optimizer_step += 1
-            else:
-                skipped_updates += 1
-            scaler.update()
-
-            curves["step"].append(optimizer_step)
-            curves["loss"].append(loss.item())
-            curves["scored_tokens"].append(scored_tokens)
-            curves["rollout_tokens"].append(total_rollout_tokens)
-            update_buffer_logits = []
-            update_buffer_tokens = 0
-
-    with open(result_path / "curves.json", "w") as fh:
-        json.dump({**curves, "skipped_updates": skipped_updates,
-                   "total_scored_tokens": scored_tokens,
-                   "total_rollout_tokens": total_rollout_tokens}, fh, indent=2)
-
-    return {"model": student_model, "curves": curves, "result_dir": str(result_path)}
-
-
-# ── Prompt pool construction ───────────────────────────────────────────────────
-
-def _build_prompt_pool(
-    math_prompts: List[dict],
-    short_prompts: List[dict],
-    seed: int,
-) -> List[dict]:
-    """
-    Build an 800-prompt pool via fixed, seeded round-robin permutation within
-    the two quota categories.  Reuse prompts after exhausting a category.
-    PDF: "selecting source prompts through a fixed, seeded round-robin permutation
-    within the two quota categories; reuse prompts after exhausting a category."
-    """
-    rng = random.Random(seed)
-    math_perm = list(math_prompts)
-    short_perm = list(short_prompts)
-    rng.shuffle(math_perm)
-    rng.shuffle(short_perm)
-
-    pool = []
-    mi, si = 0, 0
-    while len(pool) < 800:
-        if mi < len(math_perm):
-            pool.append({**math_perm[mi % len(math_perm)], "category": "math"})
-            mi += 1
-        if si < len(short_perm) and len(pool) < 800:
-            pool.append({**short_perm[si % len(short_perm)], "category": "short"})
-            si += 1
-    return pool[:800]
-
-
-def _collect_teacher_responses(
-    teacher_model,
-    tokenizer,
-    pool: List[dict],
-    seed: int,
-    device: str,
-) -> List[dict]:
-    """Generate and cache teacher responses for off-policy distillation."""
-    teacher_pool = []
-    for i, rec in enumerate(pool):
-        is_math = rec["category"] == "math"
-        cap = MATH_CAP if is_math else SHORT_CAP
-        prompt_ids = tokenizer(rec["text"], return_tensors="pt")["input_ids"].to(device)
-        response = _teacher_generate(teacher_model, tokenizer, prompt_ids, cap, device, seed + i)
-        full_ids = torch.tensor(prompt_ids[0].tolist() + response, dtype=torch.long, device=device).unsqueeze(0)
-        with torch.no_grad():
-            t_out = teacher_model(full_ids)
-        t_logits = t_out.logits[0, prompt_ids.shape[1] - 1: -1, :].float().cpu().tolist()
-        teacher_pool.append({
-            "source_id": rec.get("id", str(i)),
-            "category": rec["category"],
-            "prefix_ids": full_ids[0, :prompt_ids.shape[1] + len(response)].tolist(),
-            "teacher_logits": t_logits,
-            "n_response_tokens": len(response),
-            "termination": "eos" if response[-1] in EOS_IDS else "cap",
-        })
-    return teacher_pool
+            rseed = _h("PA4-T3-onpolicy", seed, k)
+            torch.manual_seed(rseed)
+            student.eval()
+            _sync(device)
+            t0 = time.perf_counter()
+            with ac():
+                o = sample_one(student, pids, CAP[cat], QWEN_EOS_IDS, device)
+            _sync(device)
+            cost["student_rollout_s"] += time.perf_counter() - t0
+            resp, term = o["tokens"], o["termination"]
+        n_allowed = min(len(resp), quota[cat] - scored[cat])
+        truncated = n_allowed < len(resp)
+        stats["truncated_by_quota"] += int(truncated)
+        if n_allowed > 0:
+            _sync(device)
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                t_logp = _response_logprobs(teacher, pids, resp, 0, n_allowed, device)
+            _sync(device)
+            cost["teacher_scoring_s"] += time.perf_counter() - t0
+            s = 0
+            while s < n_allowed:
+                e = min(n_allowed, s + upd["target"] - upd["n"])
+                student.train()
+                _sync(device)
+                t0 = time.perf_counter()
+                with ac():
+                    s_logp = _response_logprobs(student, pids, resp, s, e, device)
+                loss = kl_sum(t_logp[s:e], s_logp) / upd["target"]
+                scaler.scale(loss).backward()
+                _sync(device)
+                cost["student_fwd_bwd_s"] += time.perf_counter() - t0
+                upd["loss_sum"] += float(loss) * upd["target"]
+                upd["n"] += e - s
+                upd["by_cat"][cat] += e - s
+                scored[cat] += e - s
+                s = e
+                if upd["n"] == upd["target"]:
+                    t0 = time.perf_counter()
+                    scaler.unscale_(opt)
+                    gn = torch.nn.utils.clip_grad_norm_([q for q in student.parameters() if q.requires_grad],
+                                                        GRAD_CLIP)
+                    sc0 = scaler.get_scale() if scaler.is_enabled() else 1.0
+                    scaler.step(opt)
+                    scaler.update()
+                    skipped = scaler.is_enabled() and scaler.get_scale() < sc0
+                    opt.zero_grad(set_to_none=True)
+                    _sync(device)
+                    cost["optimizer_s"] += time.perf_counter() - t0
+                    stats["updates"] += 1
+                    if skipped:
+                        stats["skipped_updates"] += 1
+                        stats["skipped_at"].append(stats["updates"])
+                    done = scored["math"] + scored["short"]
+                    curves.append({"update": stats["updates"], "loss_mean_token_kl": upd["loss_sum"] / upd["n"],
+                                   "n_supervised": upd["n"], "by_category": dict(upd["by_cat"]),
+                                   "teacher_scored_tokens": done, "scored_math": scored["math"],
+                                   "scored_short": scored["short"], "lr": opt.param_groups[0]["lr"],
+                                   "grad_norm": float(gn), "skipped": bool(skipped),
+                                   "grad_scale": scaler.get_scale() if scaler.is_enabled() else None,
+                                   "elapsed_s": time.perf_counter() - t_run})
+                    if stats["updates"] % 20 == 0:
+                        log(f"[{method} s{seed}] update {stats['updates']} tokens {done}/{total_quota} "
+                            f"KL {curves[-1]['loss_mean_token_kl']:.4f}")
+                    upd = {"n": 0, "target": min(tokens_per_update, total_quota - done), "loss_sum": 0.0,
+                           "by_cat": {"math": 0, "short": 0}}
+            del t_logp
+        pres.append({"k": k, "source_id": p["id"], "category": cat, "visit": visit, "rollout_seed": rseed,
+                     "response_ids": resp, "termination": term, "n_response_tokens": len(resp),
+                     "teacher_scored_tokens": n_allowed, "truncated_by_quota": truncated})
+        k += 1
+    assert upd["n"] == 0, "final partial update left unapplied"
+    train_s = time.perf_counter() - t_run
+    peak = torch.cuda.max_memory_allocated() / 2 ** 20 if str(device).startswith("cuda") and torch.cuda.is_available() else None
+    student.save_pretrained(str(out / "adapter"))
+    write_jsonl(out / "presentations.jsonl.gz", pres)
+    write_json(out / "curves.json", curves, indent=None)
+    lens = {c: [x["n_response_tokens"] for x in pres if x["category"] == c] for c in ("math", "short")}
+    summary = {
+        "method": {"off": "off-policy", "on": "on-policy"}[method], "seed": seed, "quota": quota,
+        "scored_tokens": scored, "n_presentations": len(pres), **stats,
+        "presentations_by_category": {c: len(v) for c, v in lens.items()},
+        "mean_response_len": {c: (sum(v) / len(v) if v else None) for c, v in lens.items()},
+        "eos_rate": {c: (sum(x["termination"] == "eos" for x in pres if x["category"] == c) / len(v) if v else None)
+                     for c, v in lens.items()},
+        "costs_s": {**cost, "teacher_generation_s_pool": (pool_meta or {}).get("teacher_generation_seconds")
+                    if method == "off" else 0.0, "wall_train_s": train_s},
+        "peak_alloc_mb": peak, "params": counts,
+        "settings": {"lr": LR, "weight_decay": WEIGHT_DECAY, "tokens_per_update": tokens_per_update,
+                     "grad_clip": GRAD_CLIP, "lora": LORA, "caps": CAP, "precision":
+                     "FP16 backbone, FP32 LoRA + AdamW state, FP16 autocast, dynamic GradScaler"},
+        "teacher_pool_note": ("shared frozen pool built once for both off-policy seeds; its generation time "
+                              "is charged in full to each off-policy run's total") if method == "off" else None,
+    }
+    write_json(out / "summary.json", summary)
+    return summary
