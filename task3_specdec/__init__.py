@@ -1,3 +1,4 @@
-from .speculative import exact_speculative_step, exact_speculative_generate, SpeculativeSampler
-from .distill import offpolicy_distill, onpolicy_distill
-from .prefix_eval import evaluate_prefix_bank, compute_alignment_metrics
+"""Task 3: exact speculative sampling, LoRA policy distillation, prefix-bank alignment.
+
+Submodules are imported explicitly (e.g. `from task3_specdec import speculative`).
+"""
