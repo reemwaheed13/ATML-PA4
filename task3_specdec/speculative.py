@@ -10,9 +10,12 @@ exact code that produces the real tokens.  Randomness: torch.rand / torch.multin
 on the global generators (seed with torch.manual_seed).
 
 Cache discipline of `speculative_generate` (batch 1):
-  * INVARIANT: after every round, the target and the draft caches hold the committed
-    sequence (prompt + emitted tokens) EXCEPT its last token (the draft may lag by one
-    more token after a fully accepted round; it catches up on its next forward).
+  * INVARIANT: after every round, the target cache holds the committed sequence
+    (prompt + emitted tokens) EXCEPT its last token (keep = len(committed) - 1 positions).
+    The draft cache never exceeds keep; after a round that ran the draft (n_max > 0) it
+    holds at least keep - 1.  A one-token round (n_max == 0) skips the draft, so after a
+    bonus round it may lag by 2; the next round's feed = committed[cache_len(dc):]
+    catches up any lag.
   * prefill: prompt[:-1] into both caches (one forward each).
   * a round: the draft extends from its cache, proposing n = min(γ, remaining-1) tokens
     (stopping early at an EOS proposal).  The target receives
@@ -309,7 +312,8 @@ def speculative_generate(target, draft, prompt_ids: Sequence[int], max_new_token
         t4 = time.perf_counter()
         if debug_check:
             assert cache_len(tc) == keep, (cache_len(tc), keep)
-            assert keep - 1 <= cache_len(dc) <= keep, (cache_len(dc), keep)
+            assert cache_len(dc) <= keep and (n_max == 0 or cache_len(dc) >= keep - 1), (
+                cache_len(dc), keep, n_max)
         st.n_rounds += 1
         st.n_proposed += res.n_proposed
         st.n_examined += res.n_examined

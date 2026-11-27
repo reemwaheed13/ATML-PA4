@@ -166,8 +166,8 @@ class TestSelection(unittest.TestCase):
             self.assertTrue(set(range(8)) <= set(fp16))
 
     def test_hybrid_encode_decode_bytes_and_exact_fp16(self):
-        c = rand_cache(L=300)
-        L = 300
+        L = 1024
+        c = rand_cache(L=L)
         budget = kvc.int_bytes(L, 2, 2, 128, 4)
         imp = torch.rand(L, generator=torch.Generator().manual_seed(SEED))
         fp16, hb = kvc.select_hybrid(L, imp, budget, 2, 2, 128)
@@ -176,6 +176,15 @@ class TestSelection(unittest.TestCase):
         d = kvc.decode_hybrid(p, dtype=torch.float32)
         idx = torch.tensor(fp16)
         self.assertLess((kvc._layer_keys(d, 1)[:, :, idx] - kvc._layer_keys(c, 1)[:, :, idx]).abs().max().item(), 1e-2)
+
+    def test_hybrid_raises_when_fp16_floor_exceeds_budget(self):
+        # 8 sink + 64 recent FP16 positions alone exceed the INT4 budget at L=300
+        # (select_hybrid first fits at L~600; real contexts are 2048/4096).
+        L = 300
+        budget = kvc.int_bytes(L, 2, 2, 128, 4)
+        imp = torch.rand(L, generator=torch.Generator().manual_seed(SEED))
+        with self.assertRaises(ValueError):
+            kvc.select_hybrid(L, imp, budget, 2, 2, 128)
 
     def test_evict_keeps_positions_in_order(self):
         c = rand_cache(L=16, d=64)
