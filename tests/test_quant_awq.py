@@ -90,22 +90,32 @@ class TestAWQ(unittest.TestCase):
 
     def test_mixed_budget_includes_compensating_bytes(self):
         from task1_compression.baseline import enumerate_eligible_projections
-        from task1_compression.quant_mixed import allocate_bits, mixed_precision_quantize
+        from task1_compression.quant_mixed import (allocate, bit_error_table,
+                                                   quantize_with_allocation)
 
         projs = enumerate_eligible_projections(self.model)
-        uniform4 = sum(math.ceil(m.weight.numel() * 4 / 8) + math.ceil(m.weight.numel() / 128) * 4
+        uniform4 = sum(math.ceil(m.weight.numel() * 4 / 8)
+                       + math.ceil(m.weight.shape[1] / 128) * 4 * m.weight.shape[0]
                        + 2 * m.weight.shape[1] for _, m in projs)
-        sens = {n: float(i) for i, (n, _) in enumerate(projs)}
-        alloc = allocate_bits(sens, self.model, uniform4, n_uncompressed=0)
-        # With the compensating bytes in both budget and cost, uniform INT4 fits exactly.
-        cost = sum(math.ceil(m.weight.numel() * alloc[n] / 8) + math.ceil(m.weight.numel() / 128) * 4
-                   + 2 * m.weight.shape[1] for n, m in projs)
-        self.assertLessEqual(cost, uniform4)
-        res = mixed_precision_quantize(self.model, self.stats, alloc)
+        bits = (4, 8)
+        table = bit_error_table(self.model, self.stats, bits=bits, group_size=128, device="cpu")["table"]
+        for n, m in projs:
+            self.assertEqual(table[n][4]["bytes"],
+                             math.ceil(m.weight.numel() * 4 / 8)
+                             + math.ceil(m.weight.shape[1] / 128) * 4 * m.weight.shape[0]
+                             + 2 * m.weight.shape[1])
+
+        # With the compensating bytes in both budget and cost, uniform INT4 fits
+        # exactly and no upgrade fits on top of it.
+        alloc = allocate(table, uniform4, b_min=4, allowed_bits=bits)
+        self.assertEqual(alloc["bits"], {n: 4 for n, _ in projs})
+        self.assertLessEqual(alloc["total_bytes"], uniform4)
+
+        res = quantize_with_allocation(self.model, table, alloc["bits"], group_size=128, device="cpu")
+        self.assertEqual(set(res), {n for n, _ in projs})
         for n, m in projs:
             self.assertEqual(res[n]["compensating_scale_bytes"], 2 * m.weight.shape[1])
         self.assertLessEqual(sum(r["total_bytes"] for r in res.values()), uniform4)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

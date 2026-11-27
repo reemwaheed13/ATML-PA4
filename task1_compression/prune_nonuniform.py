@@ -179,7 +179,10 @@ def allocate(sens: Dict[int, float], S: float, lam: float,
     def total(c):
         return sum(min(s_max, max(s_min, s_raw[l] + c)) * N_l[l] for l in blocks)
 
-    lo, hi = -1.0, 1.0  # total(lo) = s_min*N <= target <= s_max*N = total(hi)
+    # Bracket wide enough that every block clamps to s_min at lo and s_max at hi,
+    # since s_raw ranges over [S - |lam|, S + |lam|] with S in [0, 1].
+    lo, hi = -(1.0 + abs(lam)), 1.0 + abs(lam)
+    assert total(lo) <= target_zeros <= total(hi), "bisection bracket does not contain target"
     for _ in range(200):
         mid = 0.5 * (lo + hi)
         if total(mid) < target_zeros:
