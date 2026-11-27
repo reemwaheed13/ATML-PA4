@@ -166,3 +166,33 @@ def bootstrap_paired_accuracy(
     hi = diffs[int((1 - alpha / 2) * n_resamples)]
 
     return {"observed_diff": obs_diff, "ci_lo": lo, "ci_hi": hi, "n_resamples": n_resamples}
+
+
+def bootstrap_paired_mean(
+    values_a: List[float],
+    values_b: List[float],
+    n_resamples: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 6304,
+    statistic: str = "diff",
+) -> Dict:
+    """Paired bootstrap CI over matched units (prompts) for mean(b) - mean(a)
+    (statistic='diff') or mean(b) / mean(a) (statistic='ratio').
+    values_{a,b}: per-unit values in matched order."""
+    assert len(values_a) == len(values_b) and len(values_a) > 0
+    n = len(values_a)
+    rng = random.Random(seed)
+
+    def stat(idx):
+        ma = sum(values_a[i] for i in idx) / len(idx)
+        mb = sum(values_b[i] for i in idx) / len(idx)
+        if statistic == "ratio":
+            return mb / ma if ma != 0 else float("nan")
+        return mb - ma
+
+    obs = stat(range(n))
+    draws = sorted(stat([rng.randint(0, n - 1) for _ in range(n)]) for _ in range(n_resamples))
+    lo = draws[int((alpha / 2) * n_resamples)]
+    hi = draws[min(n_resamples - 1, int((1 - alpha / 2) * n_resamples))]
+    return {"observed": obs, "ci_lo": lo, "ci_hi": hi, "n_resamples": n_resamples,
+            "n_units": n, "statistic": statistic}

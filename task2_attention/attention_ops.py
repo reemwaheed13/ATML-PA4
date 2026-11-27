@@ -1,249 +1,184 @@
 """
-A1 / A2 / A3: Attention operator implementations and benchmarks.
+A1 / A2 / A3: attention operators (PDF §2 Part A).
 
-A1: Dense causal attention — explicit QK^T, causal mask, stable softmax, × V.
-A2: Online-softmax tiled causal attention — exact blockwise, no full score matrix.
-A3: PyTorch SDPA — benchmark only; dispatched backend is recorded, not assumed.
+A1 dense_causal_attention  explicit Q K^T, causal mask, numerically stable softmax, x V.
+                           Materialises the (L, L) score matrix.
+A2 tiled_causal_attention  exact blockwise forward with the online-softmax update
+                           (m' = max(m, max s); l' = e^{m-m'} l + sum e^{s-m'};
+                           o' = e^{m-m'} o + sum e^{s-m'} V; A = o'/l').  Never materialises
+                           the full score matrix: per (query tile, key tile) it holds one
+                           tile x tile score block; running m, l, o are kept in FP32.
+                           Key tiles entirely in the future of a query tile are skipped.
+                           (FP64 inputs keep FP64 statistics, used only by the unit tests.)
+A3 sdpa_attention          torch.nn.functional.scaled_dot_product_attention, optionally
+                           forcing a backend; `dispatched_sdpa_backend` records the kernel
+                           that actually ran (from CUDA profiler kernel names), instead of
+                           assuming FlashAttention.
 
-Design notes:
-  - A1/A2 are REFERENCE implementations, not optimised kernels.
-    A slow Python tiled implementation does not prove tiling is inherently slow.
-  - Both must produce outputs numerically equivalent to FP32 dense attention.
-  - Backward through A2 uses standard autograd and materialises intermediates;
-    this must be noted as a limitation, not described as FlashAttention.
+All three accept an optional key-validity mask `key_mask` (B, L) bool (True = valid);
+a query row with no valid causal key ("all-masked") returns 0 in A1/A2 (no NaN, finite
+gradients).  What SDPA returns for such rows is recorded, not assumed.
+
+LIMITATIONS (stated in every Part A result): A1/A2 are Python reference
+implementations.  The A2 backward pass is plain autograd through the Python loop and
+stores every tile's intermediates, so its backward memory/time say nothing about a fused
+IO-aware kernel; A2 is NOT FlashAttention.
 """
 
-from typing import Optional, Tuple
 import math
+from contextlib import nullcontext
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn.functional as F
 
 
-# ── A1: Dense causal attention ─────────────────────────────────────────────────
+def _stable_softmax(s: torch.Tensor) -> torch.Tensor:
+    """softmax over the last dim that returns 0 for rows that are entirely -inf."""
+    m = s.amax(dim=-1, keepdim=True)
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+    e = torch.exp(s - m)
+    l = e.sum(dim=-1, keepdim=True)
+    return e / torch.where(l > 0, l, torch.ones_like(l))
 
-def dense_causal_attention(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    scale: Optional[float] = None,
-) -> torch.Tensor:
-    """
-    Explicit causal attention.  Materialises the full (L, L) score matrix.
 
-    Q, K, V  shape (B, H, L, d)
-    Returns  shape (B, H, L, d)
+def _allowed(L: int, device, key_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    """(B or 1, 1, L, L) bool: causal & valid key."""
+    c = torch.ones(L, L, dtype=torch.bool, device=device).tril()
+    if key_mask is None:
+        return c.view(1, 1, L, L)
+    return c.view(1, 1, L, L) & key_mask.view(key_mask.shape[0], 1, 1, L)
 
-    Causality: position i can only attend to j ≤ i.
-    Verified by the caller (or the test suite) by perturbing future K/V and
-    checking that the output is unchanged.
-    """
+
+def dense_causal_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+                           scale: Optional[float] = None,
+                           key_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """A1. Q, K, V (B, H, L, d) -> (B, H, L, d), computed in the input dtype."""
+    L, d = Q.shape[-2], Q.shape[-1]
+    scale = 1.0 / math.sqrt(d) if scale is None else scale
+    s = torch.matmul(Q, K.transpose(-2, -1)) * scale
+    s = s.masked_fill(~_allowed(L, Q.device, key_mask), float("-inf"))
+    return torch.matmul(_stable_softmax(s), V)
+
+
+def tiled_causal_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, tile_size: int = 64,
+                           scale: Optional[float] = None,
+                           key_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """A2. Exact online-softmax tiled causal attention; FP32 running statistics,
+    output cast back to the input dtype."""
     B, H, L, d = Q.shape
-    if scale is None:
-        scale = 1.0 / math.sqrt(d)
-
-    scores = torch.matmul(Q, K.transpose(-2, -1)) * scale  # (B, H, L, L)
-
-    # Causal mask: positions above the diagonal are -inf.
-    causal_mask = torch.triu(
-        torch.full((L, L), float("-inf"), device=Q.device, dtype=scores.dtype),
-        diagonal=1,
-    )
-    scores = scores + causal_mask
-
-    attn = F.softmax(scores, dim=-1)  # (B, H, L, L); rows with all -inf → nan
-    # Replace NaN (fully masked rows, only position 0 has no preceding tokens) with 0.
-    attn = torch.nan_to_num(attn, nan=0.0)
-
-    return torch.matmul(attn, V)  # (B, H, L, d)
-
-
-# ── A2: Online-softmax tiled causal attention ──────────────────────────────────
-
-def tiled_causal_attention(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    tile_size: int = 64,
-    scale: Optional[float] = None,
-) -> torch.Tensor:
-    """
-    Exact causal attention using the online-softmax tile update (Algorithm 1 of
-    Dao et al. 2022, re-derived for correctness verification).
-
-    Does NOT materialise the full (L, L) score matrix.
-    Intermediate storage per query block: O(tile_size × d) rather than O(L × d).
-
-    This is a PYTHON reference — it is not a fused IO-aware kernel and need not
-    have the same speed as FlashAttention.  Backward uses autograd and stores
-    all intermediates; this is stated explicitly as a limitation.
-
-    Q, K, V  shape (B, H, L, d)
-    Returns  shape (B, H, L, d)
-    """
-    B, H, L, d = Q.shape
-    if scale is None:
-        scale = 1.0 / math.sqrt(d)
-
-    out = torch.zeros_like(Q)
-
-    for q_start in range(0, L, tile_size):
-        q_end = min(q_start + tile_size, L)
-        Qi = Q[:, :, q_start:q_end, :]  # (B, H, q_tile, d)
-        q_tile = q_end - q_start
-
-        # Running stats per query position: (B, H, q_tile)
-        m = torch.full((B, H, q_tile), float("-inf"), device=Q.device, dtype=Q.dtype)
-        ell = torch.zeros(B, H, q_tile, device=Q.device, dtype=Q.dtype)
-        o = torch.zeros(B, H, q_tile, d, device=Q.device, dtype=Q.dtype)
-
-        for k_start in range(0, L, tile_size):
-            k_end = min(k_start + tile_size, L)
-            Kj = K[:, :, k_start:k_end, :]  # (B, H, k_tile, d)
-            Vj = V[:, :, k_start:k_end, :]
-
-            # Scores for this query-key tile: (B, H, q_tile, k_tile)
-            s = torch.matmul(Qi, Kj.transpose(-2, -1)) * scale
-
-            # Causal masking within tile.
-            q_positions = torch.arange(q_start, q_end, device=Q.device).unsqueeze(1)  # (q_tile, 1)
-            k_positions = torch.arange(k_start, k_end, device=Q.device).unsqueeze(0)  # (1, k_tile)
-            future_mask = k_positions > q_positions  # (q_tile, k_tile) — True means mask
-            s = s.masked_fill(future_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-            # Online softmax update.
-            tile_max = s.amax(dim=-1)  # (B, H, q_tile)
-            m_new = torch.maximum(m, tile_max)
-
-            # Rescale old accumulator.
-            rescale = torch.exp(m - m_new)  # (B, H, q_tile)
-            ell = rescale * ell + torch.exp(s - m_new.unsqueeze(-1)).sum(dim=-1)
-            o = rescale.unsqueeze(-1) * o + torch.matmul(
-                torch.exp(s - m_new.unsqueeze(-1)), Vj
-            )
+    scale = 1.0 / math.sqrt(d) if scale is None else scale
+    acc = torch.float64 if Q.dtype == torch.float64 else torch.float32
+    out_tiles = []
+    for qs in range(0, L, tile_size):
+        qe = min(qs + tile_size, L)
+        Qi = Q[:, :, qs:qe].to(acc)
+        m = torch.full((B, H, qe - qs, 1), float("-inf"), device=Q.device, dtype=acc)
+        l = torch.zeros(B, H, qe - qs, 1, device=Q.device, dtype=acc)
+        o = torch.zeros(B, H, qe - qs, d, device=Q.device, dtype=acc)
+        qpos = torch.arange(qs, qe, device=Q.device).view(-1, 1)
+        for ks in range(0, qe, tile_size):          # tiles with ks >= qe are fully future: skipped
+            ke = min(ks + tile_size, L)
+            s = torch.matmul(Qi, K[:, :, ks:ke].to(acc).transpose(-2, -1)) * scale
+            allowed = torch.arange(ks, ke, device=Q.device).view(1, -1) <= qpos
+            allowed = allowed.view(1, 1, qe - qs, ke - ks)
+            if key_mask is not None:
+                allowed = allowed & key_mask[:, ks:ke].view(B, 1, 1, ke - ks)
+            s = s.masked_fill(~allowed, float("-inf"))
+            m_new = torch.maximum(m, s.amax(dim=-1, keepdim=True))
+            m_safe = torch.where(torch.isfinite(m_new), m_new, torch.zeros_like(m_new))
+            alpha = torch.exp(m - m_safe)            # 0 when m = -inf
+            p = torch.exp(s - m_safe)
+            l = alpha * l + p.sum(dim=-1, keepdim=True)
+            o = alpha * o + torch.matmul(p, V[:, :, ks:ke].to(acc))
             m = m_new
-
-        # Normalise.
-        ell_safe = ell.clamp(min=1e-8).unsqueeze(-1)
-        out[:, :, q_start:q_end, :] = o / ell_safe
-
-    return out
+        out_tiles.append(o / torch.where(l > 0, l, torch.ones_like(l)))
+    return torch.cat(out_tiles, dim=2).to(Q.dtype)
 
 
-# ── A3: PyTorch SDPA ───────────────────────────────────────────────────────────
+# ── A3: SDPA ──────────────────────────────────────────────────────────────────
 
-def sdpa_attention(
-    Q: torch.Tensor,
-    K: torch.Tensor,
-    V: torch.Tensor,
-    scale: Optional[float] = None,
-    record_backend: bool = True,
-) -> Tuple[torch.Tensor, str]:
-    """
-    Benchmark wrapper for torch.nn.functional.scaled_dot_product_attention.
+def _sdpa_backends():
+    from torch.nn.attention import SDPBackend
+    names = {"flash": "FLASH_ATTENTION", "efficient": "EFFICIENT_ATTENTION", "math": "MATH",
+             "cudnn": "CUDNN_ATTENTION"}
+    return {k: getattr(SDPBackend, v) for k, v in names.items() if hasattr(SDPBackend, v)}
 
-    Returns (output, backend_name).
-    backend_name is recorded from torch.backends.cuda.sdp_kernel() context;
-    if no CUDA is available it falls back to 'math' (default).
 
-    The dispatched backend depends on the GPU, dtype, mask type, and PyTorch
-    version — it is NOT assumed to be FlashAttention.
-    """
-    if scale is None:
-        scale = 1.0 / math.sqrt(Q.shape[-1])
-
-    # Detect backend.
-    backend = "unknown"
-    if Q.is_cuda:
-        try:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=True, enable_mem_efficient=True
-            ):
-                out = F.scaled_dot_product_attention(
-                    Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=True, scale=scale
-                )
-            # torch.backends.cuda.flash_sdp_enabled() etc. — record after the call.
-            backend = _detect_sdpa_backend(Q)
-        except Exception as e:
-            backend = f"error:{e}"
-            out = F.scaled_dot_product_attention(
-                Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=True, scale=scale
-            )
+def sdpa_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, scale: Optional[float] = None,
+                   backend: Optional[str] = None,
+                   key_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """A3. backend None = default dispatch; else 'flash' | 'efficient' | 'math' | 'cudnn'
+    is forced via torch.nn.attention.sdpa_kernel (raises RuntimeError if unsupported)."""
+    scale = 1.0 / math.sqrt(Q.shape[-1]) if scale is None else scale
+    if backend is None:
+        ctx = nullcontext()
     else:
-        out = F.scaled_dot_product_attention(
-            Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=True, scale=scale
-        )
-        backend = "math_cpu"
+        from torch.nn.attention import sdpa_kernel
+        bk = _sdpa_backends()
+        if backend not in bk:
+            raise RuntimeError(f"SDPA backend {backend!r} not available in this torch build: not supported")
+        ctx = sdpa_kernel([bk[backend]])
+    with ctx:
+        if key_mask is None:
+            return F.scaled_dot_product_attention(Q, K, V, is_causal=True, scale=scale)
+        return F.scaled_dot_product_attention(Q, K, V, attn_mask=_allowed(Q.shape[-2], Q.device, key_mask),
+                                              scale=scale)
 
-    return out, backend
+
+KERNEL_PATTERNS = [("flash", ("flash",)), ("cudnn", ("cudnn",)),
+                   ("efficient", ("efficient", "fmha", "mem_eff", "cutlass")),]
 
 
-def _detect_sdpa_backend(Q: torch.Tensor) -> str:
-    """Heuristic: check which SDPA sub-kernel is enabled for this tensor config."""
+def classify_kernels(names: List[str]) -> str:
+    low = [n.lower() for n in names]
+    for label, pats in KERNEL_PATTERNS:
+        if any(p in n for n in low for p in pats):
+            return label
+    return "math" if low else "unknown"
+
+
+def dispatched_sdpa_backend(Q, K, V, backward: bool = False) -> dict:
+    """Run default-dispatch SDPA once under the CUDA profiler and classify the kernels
+    that actually executed.  Returns {'backend', 'kernels' (top names)}."""
     if not Q.is_cuda:
-        return "math_cpu"
-    try:
-        if torch.backends.cuda.flash_sdp_enabled():
-            return "flash_attention"
-        if torch.backends.cuda.mem_efficient_sdp_enabled():
-            return "mem_efficient"
-        return "math"
-    except Exception:
-        return "unknown"
+        return {"backend": "math_cpu", "kernels": []}
+    from torch.profiler import ProfilerActivity, profile
+    q, k, v = (t.detach().clone().requires_grad_(backward) for t in (Q, K, V))
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        out = sdpa_attention(q, k, v)
+        if backward:
+            out.sum().backward()
+        torch.cuda.synchronize()
+    names = sorted({e.key for e in prof.key_averages() if e.device_type is not None
+                    and "cuda" in str(e.device_type).lower()})
+    if not names:
+        names = sorted({e.key for e in prof.key_averages()})
+    attn_like = [n for n in names if any(p in n.lower() for p in
+                                         ("attn", "attention", "fmha", "flash", "softmax", "sdp", "cudnn"))]
+    return {"backend": classify_kernels(attn_like or names), "kernels": (attn_like or names)[:12]}
 
 
-# ── Verification helpers ───────────────────────────────────────────────────────
+# ── Verification helpers ──────────────────────────────────────────────────────
 
-def verify_causality(attn_fn, B=1, H=2, L=16, d=32, device="cpu", dtype=torch.float32):
-    """
-    Check that perturbing future K/V at position j > i does not change output at i.
-    Raises AssertionError if the attention function is not causal.
-    """
-    torch.manual_seed(6304)
-    Q = torch.randn(B, H, L, d, device=device, dtype=dtype)
-    K = torch.randn(B, H, L, d, device=device, dtype=dtype)
-    V = torch.randn(B, H, L, d, device=device, dtype=dtype)
-
-    out_ref = attn_fn(Q, K, V)
-    if isinstance(out_ref, tuple):
-        out_ref = out_ref[0]
-
-    # Perturb K and V at position L-1 (the last, future-most token) and check
-    # that position 0's output is unchanged.
-    K2 = K.clone()
-    V2 = V.clone()
-    K2[:, :, -1, :] += 1000.0
-    V2[:, :, -1, :] += 1000.0
-    out_perturbed = attn_fn(Q, K2, V2)
-    if isinstance(out_perturbed, tuple):
-        out_perturbed = out_perturbed[0]
-
-    max_diff = (out_ref[:, :, 0, :] - out_perturbed[:, :, 0, :]).abs().max().item()
-    assert max_diff < 1e-5, f"Causality violated: position 0 changed by {max_diff}"
-    return True
+def verify_causality(attn_fn, B=1, H=2, L=32, d=16, j=None, device="cpu", dtype=torch.float32) -> dict:
+    """Perturb keys/values at every position >= j; outputs at every i < j must be
+    unchanged and outputs at i >= j must change."""
+    j = L // 2 if j is None else j
+    g = torch.Generator(device="cpu").manual_seed(6304)
+    Q, K, V = (torch.randn(B, H, L, d, generator=g).to(device, dtype) for _ in range(3))
+    K2, V2 = K.clone(), V.clone()
+    K2[:, :, j:] += 100.0 * torch.randn(B, H, L - j, d, generator=g).to(device, dtype)
+    V2[:, :, j:] += 100.0
+    a, b = attn_fn(Q, K, V), attn_fn(Q, K2, V2)
+    past = (a[:, :, :j] - b[:, :, :j]).abs().max().item()
+    fut = (a[:, :, j:] - b[:, :, j:]).abs().max().item()
+    return {"max_change_before_j": past, "max_change_from_j": fut, "j": j, "L": L,
+            "causal": past == 0.0 and fut > 0.0}
 
 
-def compare_to_reference(
-    fn_a, fn_b, B=2, H=4, L=256, d=64, device="cuda", dtype=torch.float32, atol=1e-3
-) -> dict:
-    """
-    Compare two attention functions on identical inputs.
-    Returns dict with max_abs_diff and mean_abs_diff.
-    """
-    torch.manual_seed(6304)
-    Q = torch.randn(B, H, L, d, device=device, dtype=dtype)
-    K = torch.randn(B, H, L, d, device=device, dtype=dtype)
-    V = torch.randn(B, H, L, d, device=device, dtype=dtype)
-
-    out_a = fn_a(Q, K, V)
-    out_b = fn_b(Q, K, V)
-    if isinstance(out_a, tuple):
-        out_a = out_a[0]
-    if isinstance(out_b, tuple):
-        out_b = out_b[0]
-
-    diff = (out_a - out_b).abs()
-    return {
-        "max_abs_diff": diff.max().item(),
-        "mean_abs_diff": diff.mean().item(),
-        "within_atol": (diff < atol).all().item(),
-    }
+def compare(out: torch.Tensor, ref: torch.Tensor) -> dict:
+    d = (out.float() - ref.float()).abs()
+    return {"max_abs": float(d.max()), "mean_abs": float(d.mean()),
+            "rel_fro": float(d.norm() / ref.float().norm().clamp_min(1e-30)),
+            "finite": bool(torch.isfinite(out).all())}

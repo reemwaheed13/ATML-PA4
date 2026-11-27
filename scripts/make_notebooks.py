@@ -121,6 +121,11 @@ resumable: re-running a cell after a disconnect skips finished runs; a failed ru
 | 4 | CPU unit tests | 3-5 min |
 | 5 | 2B: the 42-run MQAR grid (B1, B2, B3 x 3 seeds) | ~1-1.5 h (first call also builds 6 training streams, ~10 min) |
 | 6 | 2B: forward-only sweep T in {256,1024,4096,8192} | ~5 min |
+| 7 | 2A: dense / tiled / SDPA sweep (FP32+FP16, L 256..8192) + causality, tile, edge-case checks | ~15-25 min |
+| 8 | 2C: C1 cache validation (split prefill, 100% retention, scoring vs SDPA) | ~2 min |
+| 9 | 2C: 180 prompts x 6 cache methods (C2-C5) | ~20-30 min |
+| 10 | 2C: C5 packed encode/decode benchmark (B 1/8, L 2048/4096) | ~5 min |
+| 11 | Aggregate: every Task 2 table and plot | ~2 min |
 ''')
 
 T2_B_GRID = code('''
@@ -157,11 +162,83 @@ print('PASS' if rc == 0 and len(recs) == 24 else 'FAIL')
 ''')
 
 
+T2_A = code('''
+# Cell 7: 2A - attention operators (resumable per dtype x L x method)
+rc = run_driver('task2_attention.run_task2', ['2a', '--results-root', T2])
+import glob
+recs = [json.load(open(f)) for f in sorted(glob.glob(f'{T2}/a/conditions/*.json')) if not f.endswith('.error.json')]
+errs = sorted(glob.glob(f'{T2}/a/conditions/*.error.json'))
+for r in sorted(recs, key=lambda r: (r['dtype'], r['method'], r['L'])):
+    fw = (r.get('forward') or {}).get('mean_ms'); fb = (r.get('forward_backward') or {}).get('mean_ms')
+    e = (r.get('output_error') or {}).get('max_abs')
+    disp = (r.get('dispatched_forward') or {}).get('backend', '')
+    print('%-5s %-15s L=%5d %-11s fwd %9s fwd+bwd %9s max|err| %10s %s' % (
+        r['dtype'], r['method'], r['L'], r['status'], '%.2f' % fw if fw else '-', '%.2f' % fb if fb else '-',
+        '%.2e' % e if e is not None else '-', disp))
+chk = json.load(open(f'{T2}/a/checks.json'))
+causal_ok = all(v.get('causal', True) for v in chk['causality'].values())
+print('causality:', {k: v.get('causal', v.get('status')) for k, v in chk['causality'].items()})
+print('errors:', errs)
+print('PASS' if rc == 0 and len(recs) == 6 * 2 * 7 and not errs and causal_ok else 'FAIL')
+''')
+
+T2_C1 = code('''
+# Cell 8: 2C - C1 validation of the FP16 cache path (run before interpreting compressed caches)
+rc = run_driver('task2_attention.run_task2', ['2c', '--stage', 'c1', '--data-repo', DATA_REPO, '--results-root', T2])
+c1 = json.load(open(f'{T2}/c/c1_validation.json'))
+for c in c1['cases']:
+    print(f"{c['id']}: Lctx={c['context_len']} max|dlogit|={c['split_vs_full_max_abs_logit_diff']:.3e} "
+          f"argmax agree={c['split_vs_full_argmax_agreement']:.3f} greedy==100%-retention:{c['full_retention_matches_greedy']} "
+          f"finite:{c['all_logits_finite']} scoring err={c['scoring_manual_vs_sdpa_max_abs_err']:.2e} "
+          f"cache unchanged:{c['scoring_cache_unchanged']}")
+print('PASS' if rc == 0 and c1['pass'] else 'FAIL')
+''')
+
+T2_C_EVAL = code('''
+# Cell 9: 2C - every KV-cache method on all 180 prompts (resumable per prompt)
+rc = run_driver('task2_attention.run_task2', ['2c', '--stage', 'eval', '--data-repo', DATA_REPO, '--results-root', T2])
+import glob
+P = [json.load(open(f)) for f in glob.glob(f'{T2}/c/prompts/*/summary.json')]
+errs = glob.glob(f'{T2}/c/prompts/*/error.json')
+for m in ['fp16', 'sink_recent', 'question_aware', 'int4_tokenwise', 'int4_channelwise', 'hybrid']:
+    R = [p['methods'][m] for p in P]
+    if R:
+        print('%-17s acc %.3f  frac-of-FP16 %.3f  within budget %s' % (
+            m, sum(r['exact_match'] for r in R) / len(R), sum(r['realized_fraction_of_fp16'] for r in R) / len(R),
+            all(r['within_budget'] in (None, True) for r in R)))
+print(f'{len(P)}/180 prompts, errors: {len(errs)}')
+print('PASS' if rc == 0 and len(P) == 180 and not errs else 'FAIL')
+''')
+
+T2_C_BENCH = code('''
+# Cell 10: 2C - C5 packed-cache encode/decode benchmark (10 warmed, synchronized reps)
+rc = run_driver('task2_attention.run_task2', ['2c', '--stage', 'bench', '--data-repo', DATA_REPO, '--results-root', T2])
+rows = json.load(open(f'{T2}/c/packed_bench.json'))
+for r in rows:
+    print('%-32s B=%d L=%d pack %.2f ms unpack %.2f ms step+unpack %.2f ms vs fp16 %.2f ms bytes %d (==formula %s)' % (
+        r['layout'], r['B'], r['L'], r['pack_ms']['mean_ms'], r['unpack_dequant_ms']['mean_ms'],
+        r['decode_step_with_unpack_ms']['mean_ms'], r['decode_step_fp16_ms']['mean_ms'], r['serialized_bytes'],
+        r['bytes_match_formula']))
+print('PASS' if rc == 0 and len(rows) == 12 and all(r['bytes_match_formula'] for r in rows) else 'FAIL')
+''')
+
+T2_AGG = code('''
+# Cell 11: aggregate - every Task 2 table (tables/*.csv|json) and plot (plots/*.png)
+rc = run_driver('task2_attention.run_task2', ['aggregate', '--results-root', T2])
+st = json.load(open(f'{T2}/tables/aggregate_status.json'))
+for part, v in st.items():
+    print(part, v.get('status'), {k: v[k] for k in v if k in ('n_conditions', 'n_runs', 'missing_runs', 'n_prompts', 'c1_validation', 'error')})
+print('tables:', sorted(os.listdir(f'{T2}/tables')))
+print('plots :', sorted(os.listdir(f'{T2}/plots')))
+print('PASS' if rc == 0 and all(v.get('status') == 'ok' for v in st.values()) else 'FAIL')
+''')
+
+
 def nb2():
     cells = [T2_INTRO] + setup_cells('task2_attention/run_task2.py', 'task2',
                                      ['data/mqar/mqar_test.jsonl.gz', 'data/mqar/mqar_development.jsonl.gz',
-                                      'scripts/mqar_generator.py'])
-    cells += [T2_B_GRID, T2_B_SWEEP]
+                                      'scripts/mqar_generator.py', 'data/kv_retrieval/kv_retrieval_cases.jsonl.gz'])
+    cells += [T2_B_GRID, T2_B_SWEEP, T2_A, T2_C1, T2_C_EVAL, T2_C_BENCH, T2_AGG]
     write("02_task2.ipynb", cells)
 
 
