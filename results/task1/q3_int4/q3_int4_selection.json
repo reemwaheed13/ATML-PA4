@@ -1,0 +1,49 @@
+{
+ "condition": "q3_int4",
+ "selected_on": "32 C4 development sequences (positions 1..L-1)",
+ "development_sha256": "523a59e69a60ef3da4ec431ebba235bfe4043d6aeadd11844e0dbb8a5b2e7fa0",
+ "criterion": "lowest development PPL (ties -> larger b_min)",
+ "b_min": 3,
+ "grid": [
+  {
+   "b_min": 2,
+   "feasible": true,
+   "dev_ppl": 14.881367983910527,
+   "dev_mean_nll": 2.7001099595818268,
+   "dev_N": 16352,
+   "total_bytes": 1164096512,
+   "sum_rel_err": 0.8646048903656655,
+   "n_upgrades": 448,
+   "bit_histogram": {
+    "2": 3,
+    "3": 17,
+    "4": 97,
+    "8": 79
+   }
+  },
+  {
+   "b_min": 3,
+   "feasible": true,
+   "dev_ppl": 13.685663468487249,
+   "dev_mean_nll": 2.616348822756056,
+   "dev_N": 16352,
+   "total_bytes": 1164096512,
+   "sum_rel_err": 0.8928091675063988,
+   "n_upgrades": 252,
+   "bit_histogram": {
+    "2": 0,
+    "3": 23,
+    "4": 94,
+    "8": 79
+   }
+  }
+ ],
+ "budget_check": {
+  "budget_definition": "TOTAL bytes of Q2 uniform INT4: payload + FP16 scale/zero metadata + 2*d_in compensating + FP16 uncompressed (tied once)",
+  "budget_bytes_q2_uniform": 1164096512,
+  "q3_total_bytes": 1164096512,
+  "fixed_uncompressed_fp16_bytes": 467037184,
+  "headroom_bytes": 0,
+  "within_budget": true
+ }
+}

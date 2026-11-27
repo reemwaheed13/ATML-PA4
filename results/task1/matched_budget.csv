@@ -1,0 +1,5 @@
+pair,quantity,adaptive,uniform_reference,difference,matched,n_eligible,selected_hyperparameter,budget_from_byte_accounting
+p3_s50 vs p2_s50,eligible-weight zeros (mask),655097856,655097856,0,True,1310195712,lambda=0.02,
+p3_s75 vs p2_s75,eligible-weight zeros (mask),982646784,982646784,0,True,1310195712,lambda=0.16,
+q3_int4 vs q2_int4,"total packed bytes (incl. metadata, compensating scales, FP16 uncompressed)",1164096512,1164096512,0,True,,b_min=3,1164096512
+q3_int3 vs q2_int3,"total packed bytes (incl. metadata, compensating scales, FP16 uncompressed)",1000322048,1000322048,0,True,,b_min=3,1000322048

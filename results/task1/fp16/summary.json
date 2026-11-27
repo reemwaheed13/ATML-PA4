@@ -1,0 +1,1195 @@
+{
+ "condition": "fp16",
+ "family": "baseline",
+ "method": "fp16",
+ "target_sparsity": null,
+ "bits": null,
+ "draft": false,
+ "hs_full": true,
+ "seed": 6304,
+ "env": {
+  "model_id": "Qwen/Qwen2.5-1.5B",
+  "model_revision": "8faed761d45a263340a0528343f099c05c9a4323",
+  "torch": "2.14.1+cu130",
+  "transformers": "4.57.1",
+  "huggingface_hub": "0.36.2",
+  "device": "cuda",
+  "cuda_device": "NVIDIA L4",
+  "dtype": "torch.float16",
+  "attn_implementation": "sdpa",
+  "calibration_file_sha256": "a82e359f28854a3d7deb0b30bec84ab5b98c1039b50643261f3a97e7860d084e",
+  "data_root": "/content/drive/MyDrive/atml-pa4-datasets/data/public_locked"
+ },
+ "compression_seconds": 0.0,
+ "compression_timing_note": "",
+ "c4_val": {
+  "N": 50000,
+  "mean_nll": 2.7055202841186525,
+  "ppl": 14.962099208390098,
+  "n_windows": 177
+ },
+ "wt2_test": {
+  "N": 50000,
+  "mean_nll": 2.779246600189209,
+  "ppl": 16.106881454215547,
+  "n_windows": 437
+ },
+ "hellaswag": {
+  "task_version": "Rowan/hellaswag@218ec52e09a7e7462a5400043bb9a69a41d06b76 split=validation, 2000 locked IDs (hellaswag_val_locked.jsonl.gz, seed 6304), zero-shot, lm-evaluation-harness acc_norm convention (loglik / len(ending) in characters)",
+  "subset": "all 2000 locked IDs",
+  "n_examples": 2000,
+  "n_matches_spec": true,
+  "raw_acc": 0.51,
+  "acc_norm": 0.6965,
+  "format": {
+   "context": "activity_label + ': ' + ctx  (fallback ctx_a + ' ' + ctx_b if ctx is empty)",
+   "continuation": "' ' + ending",
+   "tokenization": "tok(context) + tok(' ' + ending), add_special_tokens=False, tokenized separately and concatenated; every continuation token scored once",
+   "text_preprocessing": "none",
+   "metrics": "raw_acc = argmax sum loglik; acc_norm = argmax loglik / len(ending in characters)",
+   "shots": 0
+  }
+ },
+ "peak_alloc_mb_eval": 3817.25439453125,
+ "peak_alloc_mb_eval_note": "torch.cuda.max_memory_allocated over PPL (batch 4) + HellaSwag",
+ "latency": {
+  "label": "dense FP16 execution (no sparse or low-bit kernels; zeros and dequantized weights are stored and multiplied densely)",
+  "unit": "ms",
+  "batch_size": 1,
+  "prefill_512": {
+   "mean_ms": 47.94279310001457,
+   "std_ms": 1.2076090593960673,
+   "median_ms": 47.90137200006939,
+   "times_ms": [
+    49.756268000010095,
+    47.361025999975936,
+    47.5129610000522,
+    48.13732800005255,
+    46.56027199996515,
+    48.91570300003423,
+    47.90137200006939,
+    46.65043199997854,
+    49.81065899994519,
+    46.82191000006242
+   ],
+   "n_warmup": 3,
+   "n_rep": 10,
+   "definition": "one forward over 1x512 tokens, use_cache=False"
+  },
+  "prefill_2048": {
+   "mean_ms": 190.65130020002243,
+   "std_ms": 1.9022030068480933,
+   "median_ms": 190.5201740000848,
+   "times_ms": [
+    192.15268899995408,
+    188.18645999999717,
+    189.76839300000847,
+    190.5201740000848,
+    194.73571900005027,
+    189.59239299999808,
+    191.32185000000845,
+    188.55047300007755,
+    191.43366600007994,
+    190.25118499996552
+   ],
+   "n_warmup": 3,
+   "n_rep": 10,
+   "definition": "one forward over 1x2048 tokens, use_cache=False"
+  },
+  "decode_64_after_prefill_512": {
+   "mean_ms": 1972.9690490999928,
+   "std_ms": 18.480427508975463,
+   "median_ms": 1969.2313569998987,
+   "times_ms": [
+    2018.3272049999914,
+    1981.7615560000377,
+    1959.1710379999085,
+    1972.5083960000802,
+    1955.6262980000838,
+    1965.7184659999984,
+    1983.1625140000142,
+    1969.2313569998987,
+    1957.585101999939,
+    1966.5985589999764
+   ],
+   "n_warmup": 3,
+   "n_rep": 10,
+   "ms_per_token": 30.827641392187388,
+   "definition": "64 greedy decode forward passes (1 token each, KV cache) after an untimed-in-this-number 512-token cached prefill; timed separately"
+  },
+  "decode_prefill_512_cached": {
+   "mean_ms": 35.98486769998317,
+   "std_ms": 0.5216660970649656,
+   "median_ms": 35.84667799998442,
+   "times_ms": [
+    37.13341299999229,
+    36.31528999994771,
+    35.637884000038866,
+    35.84667799998442,
+    36.51847799994812,
+    35.4304710000406,
+    35.61858399996254,
+    35.872002000019165,
+    35.63683400000173,
+    35.839042999896265
+   ],
+   "n_warmup": 3,
+   "n_rep": 10
+  },
+  "peak_alloc_mb_latency": 3552.54248046875,
+  "input_ids_file": "latency_input_ids.json",
+  "input_ids_sha256": "acd5b0731cf4e7ff20393cdb65f3b65bb1136ea1f5b75a65e66fdad11e47c551"
+ },
+ "sparsity": {
+  "n_eligible": 1310195712,
+  "effective_nonzeros": 1310192798,
+  "achieved_eligible_sparsity": 2.224095204450549e-06,
+  "achieved_sparsity_by_type": {
+   "q_proj": 2.633957635778117e-06,
+   "k_proj": 2.633957635778117e-06,
+   "v_proj": 2.361479259693766e-06,
+   "o_proj": 1.922486320360406e-06,
+   "gate_proj": 2.379644484795662e-06,
+   "up_proj": 2.1279263658913194e-06,
+   "down_proj": 2.1305213979694315e-06
+  },
+  "definition": "fraction of eligible weights that are exactly zero after compression"
+ },
+ "storage": {
+  "n_params_total_unique": 1543714304,
+  "n_eligible": 1310195712,
+  "n_uncompressed": 233518592,
+  "dense_fp16_bytes": {
+   "value": 3087428608,
+   "label": "dense",
+   "definition": "2 bytes x every unique parameter (tied counted once)"
+  },
+  "theoretical_sparse_fp16_bytes": {
+   "value": 3251197244,
+   "eligible_part": 2784160060,
+   "label": "theoretical",
+   "definition": "1 mask bit per eligible weight (byte-aligned) + 16 bits per nonzero eligible weight + FP16 uncompressed params; a representation estimate, not allocated GPU memory"
+  },
+  "nominal_bits_per_eligible": 16.0,
+  "theoretical_sparse_bits_per_eligible": 16.99996441447673
+ },
+ "calibration_output_error": {
+  "definition": "D = W_compressed - W_fp16; output_err = tr(D G D^T)/n_tokens; rel_output_err = tr(D G D^T)/tr(W G W^T); G = sum_t x_t x_t^T over the 128 calibration sequences, with inputs x_t taken from the UNMODIFIED FP16 model (not the compressed model's own inputs).",
+  "global_token_weighted_mean_output_err": 0.0,
+  "global_token_weighted_mean_rel_output_err": 0.0,
+  "total_calibration_tokens_per_projection": 0,
+  "by_type": {
+   "q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0
+   },
+   "k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0
+   },
+   "v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0
+   },
+   "o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0
+   },
+   "gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0
+   },
+   "up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0
+   },
+   "down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0
+   }
+  },
+  "per_projection": {
+   "model.layers.0.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.0.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.0.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.0.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.0.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.0.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.0.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.1.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.1.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.1.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.1.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.1.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.1.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.1.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.2.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.2.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.2.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.2.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.2.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.2.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.2.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.3.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.3.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.3.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.3.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.3.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.3.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.3.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.4.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.4.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.4.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.4.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.4.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.4.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.4.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.5.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.5.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.5.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.5.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.5.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.5.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.5.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.6.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.6.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.6.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.6.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.6.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.6.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.6.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.7.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.7.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.7.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.7.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.7.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.7.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.7.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.8.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.8.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.8.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.8.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.8.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.8.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.8.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.9.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.9.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.9.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.9.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.9.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.9.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.9.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.10.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.10.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.10.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.10.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.10.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.10.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.10.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.11.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.11.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.11.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.11.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.11.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.11.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.11.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.12.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.12.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.12.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.12.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.12.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.12.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.12.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.13.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.13.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.13.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.13.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.13.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.13.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.13.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.14.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.14.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.14.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.14.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.14.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.14.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.14.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.15.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.15.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.15.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.15.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.15.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.15.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.15.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.16.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.16.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.16.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.16.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.16.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.16.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.16.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.17.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.17.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.17.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.17.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.17.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.17.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.17.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.18.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.18.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.18.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.18.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.18.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.18.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.18.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.19.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.19.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.19.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.19.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.19.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.19.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.19.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.20.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.20.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.20.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.20.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.20.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.20.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.20.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.21.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.21.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.21.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.21.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.21.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.21.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.21.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.22.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.22.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.22.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.22.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.22.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.22.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.22.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.23.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.23.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.23.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.23.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.23.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.23.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.23.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.24.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.24.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.24.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.24.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.24.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.24.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.24.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.25.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.25.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.25.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.25.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.25.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.25.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.25.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.26.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.26.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.26.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.26.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.26.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.26.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.26.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.27.self_attn.q_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.27.self_attn.k_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.27.self_attn.v_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.27.self_attn.o_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.27.mlp.gate_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.27.mlp.up_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   },
+   "model.layers.27.mlp.down_proj": {
+    "output_err": 0.0,
+    "rel_output_err": 0.0,
+    "n_tokens": 0
+   }
+  }
+ },
+ "details": {}
+}
