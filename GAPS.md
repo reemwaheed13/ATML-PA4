@@ -73,10 +73,7 @@ Session split (parallel work):
 
 ## Open / for other sessions
 
-- **Notebook not yet wired to the new calibration API.** `notebooks/00_smoke.ipynb`
-  does not call the calibration functions, so nothing breaks, but any real Task-1
-  run should use `collect_calibration_stats(...)` (with `with_gram=True` for AWQ/Q3,
-  `with_gram=False` for Wanda) instead of `collect_calibration_inputs`.
+- ~~Notebook not yet wired to the new calibration API (`notebooks/00_smoke.ipynb`)~~ — resolved: `notebooks/00_smoke.ipynb` deleted; Task 1 runs through `01_task1.ipynb` / `run_task1.py`, which use `collect_calibration_stats`.
 - ~~`prune_nonuniform.measure_block_sensitivity` is a stub~~ — replaced (P3/Q3 session):
   P3 now uses a block-level Gram sensitivity of the P2 Wanda mask at s_probe = S
   (`prune_nonuniform.block_sensitivity`), a rank-based allocation with exact global zero
@@ -85,6 +82,44 @@ Session split (parallel work):
   recorded). Q3 uses a per-projection Gram error table of the unchanged Q2 quantizer at
   {2,3,4,8} bits (`quant_mixed.bit_error_table`), greedy marginal-efficiency allocation
   under the TOTAL Q2 byte budget (`allocate`) and b_min chosen on dev (`select_bmin`).
-- Only `tests/test_proj_enumeration.py` exists; it covers enumeration/tied weights
-  and is unaffected by the above changes. No unit tests yet for masks, calibration
-  stats, or perplexity offsets.
+- ~~Only `tests/test_proj_enumeration.py` exists~~ — superseded: Task 1 tests now cover
+  perplexity, HellaSwag, AWQ, P3/Q3 and the driver; Task 2/3 tests are listed below.
+
+---
+
+## Session D — Task 2 / Task 3 completion (2026-11-27/28)
+
+Requirements checklist: `docs/REQUIREMENTS_T2T3.md` (state before this session).
+
+### Bugs fixed
+- `mqar_model`: window/dilated biases were `mask.float() * -inf` → NaN (0·−∞) on every
+  ALLOWED entry, so attention outputs were zeroed; dilated offsets were not capped at 64
+  for T > 256.
+- `kv_cache`: integer zero-point clamped to [0, 2^b−1] collapsed all-positive groups;
+  token-wise INT4 ignored the FP16 trailing-token rule; hybrid greedy loop stopped at the
+  first non-fitting n (bytes are non-monotone in n) and padded incomplete INT2 groups;
+  question-aware scoring ran the question WITHOUT the context, so layer ≥ 1 queries were wrong.
+- `speculative`: prompt fed twice, trim by round input length, removed `key_cache` API,
+  χ² harness used a separate code path (γ = 1).
+- `distill`: `kl_div(batchmean)` then `/n*256` (normalised by n²/256); HF `generate` with
+  Qwen's generation_config top_k=20 / repetition_penalty; prompts without the chat
+  template; full-vocabulary teacher logits stored as JSON lists; no per-category quota.
+
+### Decisions (see README deviations e–m)
+- B3 = `local_linear` (2 local W=33 FP16-buffer heads + 2 linear heads), state bytes equal to
+  linear. **Chosen before B1/B2 results exist** — if the observed results suggest a different
+  intervention, change `part_b.GRID_CONFIGS[-1]` / `B3_SPEC` and the `local_linear` operator
+  before running B3.
+- Test-time controls for dense models: W=64 window and content top-64 (RQ2), evaluation only.
+
+### Not verified here (no GPU / no local pytest in this session)
+- All GPU paths are untested on real hardware; CPU tests exercise the same code on tiny
+  random Qwen2 models. Run notebook cell 4 (pytest) first.
+- χ² tests use one fixed seed (6304); a correct sampler fails a 1% test with probability
+  0.01 per γ by chance.
+- Batched left-padded sampling relies on transformers 4.57.1 masking of fully padded query
+  rows (unit-tested against unpadded logits on a tiny model).
+- Time estimates in the notebooks are projections, not measurements.
+
+### Skipped: optional
+- Additional readings (§2, §3) and the cross-task discussion (§4, "not required").
