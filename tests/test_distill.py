@@ -224,6 +224,43 @@ class TestMergeAndEval(unittest.TestCase):
         self.assertEqual(len(acc), 2)
 
 
+class TestCostsStaleness(unittest.TestCase):
+    def test_costs_recomputed_when_a_draft_becomes_available(self):
+        if not HAS:
+            self.skipTest(SKIP)
+        from common.runio import write_json
+        from task3_specdec import run_task3 as rt
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            p = root / "costs" / "summary.json"
+            self.assertFalse(rt.costs_summary_stale(p, ["target", "original"]))        # missing: just run
+            self.assertEqual(rt.cost_models_available(root), ["target", "original"])
+            write_json(p, {"rows": [{"model": "target"}, {"model": "original"}]})       # old format, no "models"
+            self.assertFalse(rt.costs_summary_stale(p, rt.cost_models_available(root)))
+            t0 = rt.TRAINED[0]
+            (root / "merged" / t0).mkdir(parents=True)
+            self.assertEqual(rt.cost_models_available(root), ["target", "original"])   # merge not finished
+            write_json(root / "merge_logs" / t0 / "merge_summary.json", {})
+            (root / "distill" / t0 / "adapter").mkdir(parents=True)
+            write_json(root / "distill" / t0 / "summary.json", {})
+            exp = rt.cost_models_available(root)
+            self.assertEqual(exp, ["target", "original", f"merged_{t0}", f"unmerged_{t0}"])
+            self.assertTrue(rt.costs_summary_stale(p, exp))
+            write_json(p, {"rows": [], "models": exp})
+            self.assertFalse(rt.costs_summary_stale(p, exp))
+
+    def test_validate_pass(self):
+        if not HAS:
+            self.skipTest(SKIP)
+        from task3_specdec import run_task3 as rt
+        good = {"chi2_pass": True, "real_model_checks": [{"argmax_equal": True},
+                                                         {"max_verify_logit_err_vs_full_forward": 0.01}]}
+        self.assertTrue(rt.validate_pass(good))
+        self.assertFalse(rt.validate_pass({**good, "chi2_pass": False}))
+        self.assertFalse(rt.validate_pass({**good, "real_model_checks": [{"argmax_equal": False}]}))
+        self.assertFalse(rt.validate_pass({"chi2_pass": True}))
+
+
 class TestAggregateEmpty(unittest.TestCase):
     def test_missing_inputs_reported(self):
         if not HAS:

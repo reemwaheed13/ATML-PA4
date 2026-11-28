@@ -77,12 +77,19 @@ sweep. These are correctness implementations, not efficient sparse or linear ker
 handout allows this when it is stated).
 
 (g) Task 2B / B3. The intervention (`local_linear`: 2 local softmax heads with W=33 over an FP16
-K/V buffer, plus 2 ELU+1 linear heads with FP32 state) was fixed before the B1/B2 results
-existed. It is motivated by the linear-attention recall limits in Zoology (Arora et al. 2024)
-rather than by our own observations. W=33 and FP16 for the local buffer are the adjustments
-that make its persistent state exactly equal to the linear comparator's (16,896 B/layer). The
-trainable parameter count is identical. The prediction and the development-selection rule are
-recorded in `grid_manifest.json` before any training.
+K/V buffer, plus 2 ELU+1 linear heads with FP32 state) was fixed a priori. It is motivated by the
+linear-attention recall limits in Zoology (Arora et al. 2024), not by our own results. W=33 and FP16
+for the local buffer make its persistent state exactly equal to the linear comparator's (16,896
+B/layer), and the trainable parameter count is identical. Its prediction and development-selection
+rule were recorded in `grid_manifest.json` before training.
+B2 did not show the expected degradation with K. Linear mixed-regime test accuracy was 0.986-0.997
+at K=4, 0.991-0.999 at K=8 and 0.929-0.998 at K=16.
+B3 scored 0.062-0.099, with near, far and mixed all at about 1/16, so the prediction is falsified.
+`window_K16_mixed` fails in the same way, at about 1/16. `b_runs.csv` flags such runs in
+`at_incontext_chance` (mixed-regime test accuracy at the run's own K below 2/K); `failed_to_learn`,
+which compares the training loss with ln 64, does not catch them.
+B3 was evaluated before the B1/B2 results were reviewed. It was kept rather than replaced, because
+choosing a replacement after seeing its test results would select on the test set.
 
 (h) Task 2A. The tiled reference keeps FP32 running statistics for FP16 inputs and skips fully
 future key tiles. Its backward pass is plain autograd and stores every tile (not FlashAttention).
@@ -122,6 +129,20 @@ step. The next presentation comes from the category whose quota is less filled.
 phase so that the four-part per-round decomposition is exact. The measured throughput of both
 therefore includes that synchronisation cost. The cost-model α is the pooled
 accepted/examined fraction.
+
+(n) Task 2C / C1 pass criterion. C1 originally required the split-prefill argmax to agree with
+one full forward at every suffix position. On Colab the raw agreement was 0.970 and 0.971 for the
+two 2048-token cases: one argmax flip each, in about 34 suffix positions, with max |dlogit| 0.11-0.17
+(FP16). Greedy generation with 100% retention matched ordinary greedy generation exactly. The
+criterion is now: all logits finite, 100%-retention greedy tokens identical, scoring leaves the cache
+unchanged, the last suffix position's argmax agrees, and every mismatch is a near tie (full-forward
+top-1 minus top-2 margin <= 2 x that position's max |full - split| logit difference). The raw
+agreement, the mismatch positions, margins and logit differences are still reported
+(`c1_validation.json`, `tables/c1_validation.csv`). The near-tie condition is necessary for a
+rounding-induced flip, but every argmax flip satisfies it: a flip from token i to token j needs
+margin <= |d_i| + |d_j| <= 2 max |d|. It is therefore descriptive. The conditions that can fail
+are the last-position agreement and the greedy match. The file carries `criterion_version: 2`,
+and the driver recomputes any file with a different or missing version.
 
 ## Attribution
 

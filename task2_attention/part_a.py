@@ -175,6 +175,10 @@ def run_sweep(results_root: str, device, lengths=LENGTHS, dtypes=("fp32", "fp16"
     for L in lengths:
         todo = [(dn, m) for dn in dtypes for m in methods
                 if overwrite or not (out / f"{dn}_L{L}_{m}.json").exists()]
+        for dn in dtypes:                       # a finished condition's error file is stale
+            for m in methods:
+                if (dn, m) not in todo:
+                    (out / f"{dn}_L{L}_{m}.error.json").unlink(missing_ok=True)
         if not todo:
             status.update({f"{dn}_L{L}_{m}": "skipped" for dn in dtypes for m in methods})
             continue
@@ -188,6 +192,7 @@ def run_sweep(results_root: str, device, lengths=LENGTHS, dtypes=("fp32", "fp16"
                 rec = run_condition(m, dn, L, device, ref, n_warmup, n_rep)
                 rec["reference_available"] = ref is not None
                 write_json(out / f"{name}.json", rec)
+                (out / f"{name}.error.json").unlink(missing_ok=True)       # stale error from an earlier attempt
                 status[name] = rec["status"]
                 fw = rec.get("forward", {}).get("mean_ms")
                 fb = rec.get("forward_backward", {}).get("mean_ms")

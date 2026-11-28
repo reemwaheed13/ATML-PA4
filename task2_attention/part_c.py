@@ -304,13 +304,70 @@ def run_eval(results_root: str, data_repo: str, device: str, overwrite=False, li
 
 # ── C1 validation ─────────────────────────────────────────────────────────────
 
+# Bump when the C1 pass criterion changes: run_task2 recomputes c1_validation.json whenever
+# the stored "criterion_version" differs from this value.
+C1_CRITERION_VERSION = 2
+C1_NOTE = ("pass = all logits finite AND 100%-retention greedy tokens identical to HF greedy generate "
+           "AND scoring leaves the cache unchanged AND the last suffix position's argmax agrees between "
+           "one full forward and split prefill+suffix AND every argmax mismatch at an earlier suffix "
+           "position is a near tie (full-forward top-1 minus top-2 margin <= 2 x that position's "
+           "max |full - split| logit difference, a necessary condition for an FP16 rounding-induced flip). "
+           "The raw split_vs_full_argmax_agreement is reported but is not required to be 1.0.")
+
+
+def argmax_mismatch_report(full: torch.Tensor, split: torch.Tensor) -> dict:
+    """Compare per-position argmax of two (Q, V) logit matrices (full forward vs split
+    prefill).  For every mismatching position: the full-forward top-1 minus top-2 margin
+    and the max |full - split| logit difference at that position."""
+    full, split = full.float(), split.float()
+    diff = (full - split).abs().max(-1).values                      # (Q,)
+    top2 = full.topk(2, dim=-1).values                              # (Q, 2)
+    margin = top2[:, 0] - top2[:, 1]
+    agree = full.argmax(-1) == split.argmax(-1)
+    mism = [int(i) for i in torch.nonzero(~agree).flatten().tolist()]
+    details = [{"position": i, "full_top1_minus_top2_margin": float(margin[i]),
+                "max_abs_logit_diff": float(diff[i]),
+                "near_tie": bool(margin[i] <= 2 * diff[i])} for i in mism]
+    return {"split_vs_full_argmax_agreement": float(agree.float().mean()),
+            "mismatch_positions": mism, "mismatch_details": details,
+            "all_mismatches_near_tie": all(d["near_tie"] for d in details),
+            "last_position_argmax_agrees": bool(agree[-1])}
+
+
+def quant_diagnostic(cache: DynamicCache, bits: int = 4, group_size: int = kvc.GROUP_SIZE) -> List[dict]:
+    """Per layer: relative Frobenius error of K packed/unpacked token-wise and
+    channel-wise, and of V token-wise (INT4, 64-element groups, the existing
+    pack_tensor/unpack_tensor; the trailing L mod 64 tokens stay FP16 in both layouts),
+    and the ratio of the largest to the median per-channel max |K| (channel = one
+    (KV head, head-dim) coordinate, max over tokens)."""
+    rows = []
+
+    def rel(X, layout):
+        Xh = kvc.unpack_tensor(kvc.pack_tensor(X, layout, bits, group_size), X.dtype, group_size).float()
+        Xf = X.float()
+        den = float(Xf.pow(2).sum())
+        return math.sqrt(float((Xf - Xh).pow(2).sum()) / den) if den else 0.0
+
+    for i in range(kvc._num_layers(cache)):
+        K, V = kvc._layer_keys(cache, i), kvc._layer_values(cache, i)
+        ch = K.float().abs().amax(dim=(0, 2)).flatten()             # (H_kv * d_h,)
+        med = float(ch.median())
+        rows.append({"layer": i,
+                     "K_rel_fro_token": rel(K, "token"),
+                     "K_rel_fro_channel": rel(K, "channel"),
+                     "V_rel_fro_token": rel(V, "token"),
+                     "K_channel_absmax_max_over_median": float(ch.max()) / med if med else float("inf")})
+    return rows
+
+
 @torch.no_grad()
 def c1_validate(model, tokenizer, cases: List[dict], device: str, max_new_tokens: int = MAX_NEW_TOKENS) -> dict:
-    """(i) full-forward vs split prefill/suffix logits; (ii) 100% retention through the
-    eviction path reproduces ordinary greedy generation; (iii) all logits finite;
-    (iv) the manual FP32 scoring attention matches the SDPA attention output and leaves
-    the cache unchanged."""
-    res = []
+    """(i) full-forward vs split prefill/suffix logits (argmax mismatches must be near
+    ties, the last position must agree); (ii) 100% retention through the eviction path
+    reproduces ordinary greedy generation; (iii) all logits finite; (iv) the manual FP32
+    scoring attention matches the SDPA attention output and leaves the cache unchanged.
+    Also records a KV quantisation diagnostic (not part of pass) on each context prefill."""
+    res, qd = [], []
     for case in cases:
         P = build_prompt(tokenizer, case)
         Lc, Q = P["context_len"], P["suffix_len"]
@@ -318,11 +375,13 @@ def c1_validate(model, tokenizer, cases: List[dict], device: str, max_new_tokens
         full = model(ids, use_cache=False, logits_to_keep=Q).logits[0].float()
         cache = DynamicCache()
         kvc.forward_with_positions(model, cache, ids[:, :Lc], 0, device, logits_to_keep=1)
+        qd.append({"id": case["id"], "context_len": Lc, "layers": quant_diagnostic(cache)})
         k0 = kvc._layer_keys(cache, 0).clone()
         imp, info = kvc.question_importance(model, cache, ids[:, Lc:], Lc, validate=True)
         unchanged = kvc._seq_len(cache) == Lc and torch.equal(k0, kvc._layer_keys(cache, 0))
         split = kvc.forward_with_positions(model, kvc.clone_cache(cache), ids[:, Lc:], Lc, device).logits[0].float()
         diff = (full - split).abs()
+        mm = argmax_mismatch_report(full, split)
         ref = model.generate(ids, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1,
                              repetition_penalty=1.0, eos_token_id=list(EOS_IDS),
                              pad_token_id=tokenizer.eos_token_id)[0, ids.shape[1]:].tolist()
@@ -333,7 +392,7 @@ def c1_validate(model, tokenizer, cases: List[dict], device: str, max_new_tokens
         res.append({
             "id": case["id"], "context_len": Lc, "suffix_len": Q,
             "split_vs_full_max_abs_logit_diff": float(diff.max()),
-            "split_vs_full_argmax_agreement": float((full.argmax(-1) == split.argmax(-1)).float().mean()),
+            **mm,
             "all_logits_finite": bool(torch.isfinite(full).all() and torch.isfinite(split).all()
                                       and torch.isfinite(first).all()),
             "full_retention_tokens": got, "hf_greedy_tokens": ref,
@@ -341,11 +400,18 @@ def c1_validate(model, tokenizer, cases: List[dict], device: str, max_new_tokens
             "scoring_cache_unchanged": bool(unchanged),
             "scoring_manual_vs_sdpa_max_abs_err": max(info["manual_vs_sdpa_attention_max_abs_err_per_layer"]),
         })
-    ok = all(r["all_logits_finite"] and r["full_retention_matches_greedy"] and r["scoring_cache_unchanged"]
-             and r["split_vs_full_argmax_agreement"] == 1.0 for r in res)
-    return {"cases": res, "pass": ok,
-            "note": "FP16 SDPA: small logit differences between one full forward and split prefill are expected; "
-                    "argmax agreement and identical greedy tokens are the pass criteria"}
+    for r in res:
+        r["pass"] = bool(r["all_logits_finite"] and r["full_retention_matches_greedy"]
+                         and r["scoring_cache_unchanged"] and r["last_position_argmax_agrees"]
+                         and r["all_mismatches_near_tie"])
+    return {"criterion_version": C1_CRITERION_VERSION, "cases": res, "pass": all(r["pass"] for r in res),
+            "note": C1_NOTE,
+            "quant_diagnostic": {"bits": 4, "group_size": kvc.GROUP_SIZE, "cases": qd,
+                                 "note": "diagnostic only, not part of pass: relative Frobenius error of "
+                                         "pack->unpack over the whole (B,H,L,d) tensor of each layer after "
+                                         "the FP16 context prefill (trailing L mod 64 tokens are FP16 in "
+                                         "both layouts); int4_tokenwise uses K token + V token, "
+                                         "int4_channelwise uses K channel + V token"}}
 
 
 # ── C5 packed encode/decode benchmark ─────────────────────────────────────────

@@ -11,7 +11,8 @@ all-positive-group regression); bit packing; packed bytes == M_b(L) for both INT
 layouts; decode-time requantisation of completed groups only; eviction / hybrid
 selection within budget (hybrid maximal by brute force); hybrid encode/decode;
 C1 split-prefill equivalence, 100%-retention greedy equivalence, scoring attention
-vs SDPA and cache unchanged after scoring; an end-to-end eval_prompt on all 6
+vs SDPA and cache unchanged after scoring; the C1 argmax-mismatch / near-tie criterion and
+its version-triggered recompute; the KV quantisation diagnostic; an end-to-end eval_prompt on all 6
 methods; the packed encode/decode benchmark.
 """
 
@@ -232,6 +233,54 @@ def fake_case():
 
 
 @unittest.skipUnless(HAS_TF, TF_SKIP)
+class TestC1Criterion(unittest.TestCase):
+    def test_argmax_mismatch_report(self):
+        full = torch.tensor([[5.0, 1.0, 0.0],      # agrees
+                             [2.00, 1.95, 0.0],    # flips, margin 0.05 <= 2 * 0.06: near tie
+                             [4.0, 0.0, 0.0]])     # agrees (last position)
+        split = full.clone()
+        split[1, 1] += 0.06
+        r = part_c.argmax_mismatch_report(full, split)
+        self.assertEqual(r["mismatch_positions"], [1])
+        self.assertAlmostEqual(r["mismatch_details"][0]["full_top1_minus_top2_margin"], 0.05, places=5)
+        self.assertAlmostEqual(r["mismatch_details"][0]["max_abs_logit_diff"], 0.06, places=5)
+        self.assertTrue(r["all_mismatches_near_tie"])
+        self.assertTrue(r["last_position_argmax_agrees"])
+        self.assertAlmostEqual(r["split_vs_full_argmax_agreement"], 2 / 3, places=6)
+        # a flip from i to j needs margin <= |d_i| + |d_j| <= 2 max|d|, so every real flip
+        # satisfies the (necessary) near-tie condition, however large the perturbation
+        split2 = full.clone()
+        split2[0, 1] += 4.5
+        r2 = part_c.argmax_mismatch_report(full, split2)
+        self.assertEqual(r2["mismatch_positions"], [0])
+        self.assertTrue(r2["all_mismatches_near_tie"])
+        self.assertAlmostEqual(r2["mismatch_details"][0]["full_top1_minus_top2_margin"], 4.0, places=5)
+        # last-position disagreement is reported
+        split3 = full.clone()
+        split3[2, 2] += 5.0
+        self.assertFalse(part_c.argmax_mismatch_report(full, split3)["last_position_argmax_agrees"])
+
+    def test_c1_recompute_triggered_by_criterion_version(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from task2_attention.run_task2 import c1_needs_recompute
+        v = part_c.C1_CRITERION_VERSION
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "c1_validation.json"
+            self.assertTrue(c1_needs_recompute(p, False, v))                       # missing
+            p.write_text(json.dumps({"cases": [], "pass": False}))                 # pre-versioning file
+            self.assertTrue(c1_needs_recompute(p, False, v))
+            p.write_text(json.dumps({"criterion_version": v - 1, "cases": [], "pass": True}))
+            self.assertTrue(c1_needs_recompute(p, False, v))
+            p.write_text(json.dumps({"criterion_version": v, "cases": [], "pass": True}))
+            self.assertFalse(c1_needs_recompute(p, False, v))                      # current: skipped
+            self.assertTrue(c1_needs_recompute(p, True, v))                        # --overwrite
+            p.write_text("{not json")
+            self.assertTrue(c1_needs_recompute(p, False, v))                       # unreadable
+
+
+@unittest.skipUnless(HAS_TF, TF_SKIP)
 class TestTinyModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -329,6 +378,35 @@ class TestTinyModel(unittest.TestCase):
         self.assertTrue(c["full_retention_matches_greedy"])
         self.assertTrue(c["scoring_cache_unchanged"])
         self.assertLess(c["split_vs_full_max_abs_logit_diff"], 1e-3)
+        self.assertEqual(res["criterion_version"], part_c.C1_CRITERION_VERSION)
+        for k in ("mismatch_positions", "mismatch_details", "all_mismatches_near_tie", "last_position_argmax_agrees"):
+            self.assertIn(k, c)
+        self.assertEqual(len(c["mismatch_details"]), len(c["mismatch_positions"]))
+        self.assertTrue(c["last_position_argmax_agrees"])
+        self.assertTrue(c["all_mismatches_near_tie"])
+        self.assertTrue(res["pass"])
+        qd = res["quant_diagnostic"]["cases"]
+        self.assertEqual(len(qd), 1)
+        self.assertEqual(len(qd[0]["layers"]), self.model.config.num_hidden_layers)
+
+    def test_quant_diagnostic_tiny(self):
+        """The KV quantisation diagnostic runs on a real (tiny) prefill cache; every error
+        is finite and non-negative and the outlier ratio is >= 1."""
+        import math
+        P = part_c.build_prompt(self.tok, fake_case())
+        ids = torch.tensor([P["ids"]])
+        with torch.no_grad():
+            c = DynamicCache()
+            kvc.forward_with_positions(self.model, c, ids[:, :P["context_len"]], 0, logits_to_keep=1)
+        self.assertGreaterEqual(P["context_len"], 64)               # at least one packed group
+        rows = part_c.quant_diagnostic(c)
+        self.assertEqual([r["layer"] for r in rows], list(range(self.model.config.num_hidden_layers)))
+        for r in rows:
+            for k in ("K_rel_fro_token", "K_rel_fro_channel", "V_rel_fro_token"):
+                self.assertTrue(math.isfinite(r[k]) and r[k] >= 0.0, (k, r[k]))
+                self.assertGreater(r[k], 0.0, k)                     # INT4 is lossy on random-model K/V
+            self.assertTrue(math.isfinite(r["K_channel_absmax_max_over_median"]))
+            self.assertGreaterEqual(r["K_channel_absmax_max_over_median"], 1.0)
 
     def test_packed_bench_cpu(self):
         rows = part_c.bench_packed(self.model, "cpu", batches=(1, 2), lengths=(128,), n_warmup=0, n_rep=1,

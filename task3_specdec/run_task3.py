@@ -95,7 +95,9 @@ def st_check(ctx):
     from transformers import AutoTokenizer
     out = ctx.root / "check.json"
     if out.exists() and not ctx.args.overwrite:
-        return read_json(out)
+        prev = read_json(out)
+        if prev.get("pass"):
+            return prev                       # a stored failed check is recomputed
     dtok = AutoTokenizer.from_pretrained(gen.DRAFT_ID, revision=ctx.revs["model_draft"])
     test, train = ctx.test_prompts(), ctx.train_prompts()
     sample = [p["text"] for p in test] + [p["text"] for p in train["math"][:25] + train["short"][:25]]
@@ -116,10 +118,20 @@ def st_check(ctx):
     return res
 
 
+def validate_pass(res: dict) -> bool:
+    """The notebook's validate criterion: chi^2 checks pass, every real-model argmax
+    agrees, and the speculative debug verify logits match a full forward (< 0.5)."""
+    checks = res.get("real_model_checks", [])
+    return bool(res.get("chi2_pass") and checks and all(c.get("argmax_equal", True) for c in checks)
+                and all(c.get("max_verify_logit_err_vs_full_forward", 0) < 0.5 for c in checks))
+
+
 def st_validate(ctx):
     out = ctx.root / "sampler_validation.json"
     if out.exists() and not ctx.args.overwrite:
-        return read_json(out)
+        prev = read_json(out)
+        if validate_pass(prev):
+            return prev                       # a stored failed validation is recomputed
     res = {"chi2": [sp.chi2_test(g, correct=c) for g in (2, 4) for c in (True, False)]}
     res["chi2_pass"] = all((r["rejected_at_0.01"] != r["correct_sampler"]) and r["min_expected"] >= 10
                            for r in res["chi2"])
@@ -146,6 +158,7 @@ def st_validate(ctx):
                        "max_verify_logit_err_vs_full_forward": st.debug_max_logit_err,
                        "n_tokens": len(st.tokens)})
     res["real_model_checks"] = checks
+    res["pass"] = validate_pass(res)
     res["real_model_note"] = "FP16 SDPA: chunked-prefill differences at the 1e-2 logit level are numerical; argmax must agree"
     write_json(out, res)
     del target, draft
@@ -255,22 +268,51 @@ def st_banks_eval(ctx):
     return run_resumable(["alignment"], lambda n: out, one, ctx.args.overwrite)
 
 
+def cost_models_available(root: Path) -> list:
+    """Models the costs stage times: target and original always; the first trained draft
+    merged / unmerged once its merge / distillation has finished (marker files)."""
+    names = ["target", "original"]
+    if (root / "merged" / TRAINED[0]).exists() and (root / "merge_logs" / TRAINED[0] / "merge_summary.json").exists():
+        names.append(f"merged_{TRAINED[0]}")
+    if (root / "distill" / TRAINED[0] / "adapter").exists() and (root / "distill" / TRAINED[0] / "summary.json").exists():
+        names.append(f"unmerged_{TRAINED[0]}")
+    return names
+
+
+def costs_summary_stale(summary_path, expected_models) -> bool:
+    """True iff a costs summary exists but times a different model set than
+    `expected_models` (e.g. it was written before the merged / unmerged draft existed)."""
+    p = Path(summary_path)
+    if not p.exists():
+        return False
+    try:
+        s = read_json(p)
+        have = s.get("models") or sorted({r["model"] for r in s["rows"]})
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+    return set(have) != set(expected_models)
+
+
 def st_costs(ctx):
     out = ctx.root / "costs"
+    expected = cost_models_available(ctx.root)
+    stale = costs_summary_stale(out / "summary.json", expected)
+    if stale:
+        print(f"[costs] summary.json does not time {expected}: recomputing", flush=True)
 
     def one(_, o):
         target = ctx.load("target")
         models = {"target": target, "original": ctx.load("original")}
-        if (ctx.root / "merged" / TRAINED[0]).exists():
+        if f"merged_{TRAINED[0]}" in expected:
             models[f"merged_{TRAINED[0]}"] = ctx.load(TRAINED[0])
-        if (ctx.root / "distill" / TRAINED[0] / "adapter").exists():
+        if f"unmerged_{TRAINED[0]}" in expected:
             models[f"unmerged_{TRAINED[0]}"] = ctx.load(f"unmerged:{TRAINED[0]}")
         rows = ev.isolated_costs(models, ctx.dev)
-        write_json(o / "summary.json", {"rows": rows, "lengths": list(ev.COST_LENGTHS),
+        write_json(o / "summary.json", {"rows": rows, "models": list(models), "lengths": list(ev.COST_LENGTHS),
                                         "note": "median of 10 synchronized reps after 3 warm-ups"})
         del models, target
 
-    return run_resumable(["costs"], lambda n: out, one, ctx.args.overwrite)
+    return run_resumable(["costs"], lambda n: out, one, ctx.args.overwrite or stale)
 
 
 def _spec_units(ctx, drafts, gammas):

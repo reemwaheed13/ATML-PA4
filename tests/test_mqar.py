@@ -286,6 +286,11 @@ class TestDriverSmoke(unittest.TestCase):
             import csv
             rows = list(csv.DictReader(open(td / "t2" / "tables" / "b_runs.csv")))
             self.assertEqual(len(rows), 4)
+            for r in rows:                                     # acc(own K, mixed) < 2/K
+                exp = float(r[f"acc_K{r['K']}_mixed"]) < 2 / int(r["K"])
+                self.assertEqual(r["at_incontext_chance"], str(exp))
+            cfg = list(csv.DictReader(open(td / "t2" / "tables" / "b_configs.csv")))
+            self.assertTrue(all("n_at_incontext_chance" in r for r in cfg))
             ctrl = list(csv.DictReader(open(td / "t2" / "tables" / "b_mask_controls.csv")))
             self.assertEqual(len(ctrl), 3)                      # dense K16 mixed x 3 regimes
             self.assertTrue((td / "t2" / "tables" / "b3_intervention.csv").exists())

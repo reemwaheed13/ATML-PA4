@@ -3,7 +3,7 @@ Task 2 aggregation: every table / plot listed in PDF §2 "Required Evidence".
 
 Inputs  <root>/a/{conditions/*.json, checks.json}
         <root>/b/{grid_manifest.json, runs/*/summary.json, runs/*/curves.json, forward_sweep/*.json}
-        <root>/c/{c1_validation.json, prompts/*/summary.json, packed_bench.json}
+        <root>/c/{c1_validation.json (incl. quant_diagnostic), prompts/*/summary.json, packed_bench.json}
 Outputs <root>/tables/*.csv|json and <root>/plots/*.png  (missing inputs are reported
         in the returned dict, never silently treated as zero).
 """
@@ -158,7 +158,10 @@ def aggregate_b(root: Path, tables: Path, plots: Path) -> dict:
                "params": s["train_stats"]["n_trainable_params"], "param_ratio_vs_dense": s["param_ratio_vs_dense"],
                "ms_per_update": s["train_stats"]["ms_per_update"], "peak_alloc_mb_train": s["train_stats"]["peak_alloc_mb_train"],
                "final_train_loss": s["train_stats"]["final_train_loss_mean_last100"],
-               "chance_label": 1 / 64, "chance_1_over_K": 1 / K}
+               "chance_label": 1 / 64, "chance_1_over_K": 1 / K,
+               # in-context chance: guessing uniformly among the K keys present in the sequence
+               # gives ~1/K; failed_to_learn (train loss vs ln 64) does not catch this
+               "at_incontext_chance": c[f"K{K}_mixed"]["acc"] < 2 / K}
         for k, v in c.items():
             row[f"acc_{k}"] = v["acc"]
             row[f"loss_{k}"] = v["loss"]
@@ -183,7 +186,8 @@ def aggregate_b(root: Path, tables: Path, plots: Path) -> dict:
     for (step, a, K, reg), rs in sorted(cfg.items()):
         d = {"step": step, "attn_type": a, "K": K, "train_regime": reg, "n_seeds": len(rs),
              "seeds": ",".join(str(r["seed"]) for r in rs),
-             "n_failed_to_learn": sum(bool(r["failed_to_learn"]) for r in rs)}
+             "n_failed_to_learn": sum(bool(r["failed_to_learn"]) for r in rs),
+             "n_at_incontext_chance": sum(bool(r["at_incontext_chance"]) for r in rs)}
         for k in [k for k in rs[0] if k.startswith("acc_") or k in ("ms_per_update", "peak_alloc_mb_train", "final_train_loss")]:
             d[f"{k}_mean"] = _mean([r.get(k) for r in rs])
             d[f"{k}_std"] = _std([r.get(k) for r in rs])
@@ -349,11 +353,57 @@ PRINCIPAL = [("fp16", m) for m in C_METHODS[1:]] + [
     ("question_aware", "hybrid"), ("int4_channelwise", "hybrid")]
 
 
+def aggregate_c1(root: Path, tables: Path) -> dict:
+    """c1_validation.csv (one row per C1 case) and c_quant_diagnostic.csv (case x layer,
+    plus one per-case mean row)."""
+    p = root / "c" / "c1_validation.json"
+    if not p.exists():
+        return {"c1_validation": "missing"}
+    c1 = read_json(p)
+    rows = []
+    for c in c1["cases"]:
+        rows.append({"id": c["id"], "context_len": c["context_len"], "suffix_len": c["suffix_len"],
+                     "split_vs_full_argmax_agreement": c["split_vs_full_argmax_agreement"],
+                     "split_vs_full_max_abs_logit_diff": c["split_vs_full_max_abs_logit_diff"],
+                     "n_mismatches": len(c.get("mismatch_positions", [])),
+                     "mismatch_positions": json.dumps(c.get("mismatch_positions")),
+                     "mismatch_margins": json.dumps([d["full_top1_minus_top2_margin"]
+                                                     for d in c.get("mismatch_details", [])]),
+                     "mismatch_max_abs_logit_diffs": json.dumps([d["max_abs_logit_diff"]
+                                                                 for d in c.get("mismatch_details", [])]),
+                     "all_mismatches_near_tie": c.get("all_mismatches_near_tie"),
+                     "last_position_argmax_agrees": c.get("last_position_argmax_agrees"),
+                     "full_retention_matches_greedy": c["full_retention_matches_greedy"],
+                     "all_logits_finite": c["all_logits_finite"],
+                     "scoring_cache_unchanged": c["scoring_cache_unchanged"],
+                     "scoring_manual_vs_sdpa_max_abs_err": c["scoring_manual_vs_sdpa_max_abs_err"],
+                     "pass": c.get("pass")})
+    _write_csv(tables / "c1_validation.csv", rows)
+    out = {"c1_validation": c1["pass"], "c1_criterion_version": c1.get("criterion_version"),
+           "c1_cases": [{"id": r["id"], "n_mismatches": r["n_mismatches"],
+                         "all_mismatches_near_tie": r["all_mismatches_near_tie"]} for r in rows]}
+    qd = c1.get("quant_diagnostic")
+    if qd:
+        keys = ("K_rel_fro_token", "K_rel_fro_channel", "V_rel_fro_token", "K_channel_absmax_max_over_median")
+        qrows = []
+        for case in qd["cases"]:
+            for lr in case["layers"]:
+                qrows.append({"case": case["id"], "layer": lr["layer"], **{k: lr[k] for k in keys}})
+            qrows.append({"case": case["id"], "layer": "mean",
+                          **{k: _mean([lr[k] for lr in case["layers"]]) for k in keys}})
+        _write_csv(tables / "c_quant_diagnostic.csv", qrows)
+        out["quant_diagnostic"] = "ok"
+    else:
+        out["quant_diagnostic"] = "missing"
+    return out
+
+
 def aggregate_c(root: Path, tables: Path, plots: Path, n_resamples: int = 2000) -> dict:
+    c1 = aggregate_c1(root, tables)
     files = sorted(glob.glob(str(root / "c" / "prompts" / "*" / "summary.json")))
     P = [read_json(f) for f in files]
     if not P:
-        return {"status": "missing"}
+        return {"status": "missing", **c1}
     P.sort(key=lambda p: p["id"])
     methods = [m for m in C_METHODS if all(m in p["methods"] for p in P)]
     main = []
@@ -500,9 +550,7 @@ def aggregate_c(root: Path, tables: Path, plots: Path, n_resamples: int = 2000) 
     axes[0].set_ylabel("exact match (n per level shown in c_breakdown_by_factor.csv)")
     axes[2].legend(fontsize=7)
     _save(fig, plots / "c_accuracy_by_factor.png", made)
-    c1 = root / "c" / "c1_validation.json"
-    return {"status": "ok", "n_prompts": len(P), "methods": methods, "plots": made,
-            "c1_validation": read_json(c1)["pass"] if c1.exists() else "missing",
+    return {"status": "ok", "n_prompts": len(P), "methods": methods, "plots": made, **c1,
             "packed_bench": "ok" if bench_p.exists() else "missing"}
 
 

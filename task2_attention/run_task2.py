@@ -7,7 +7,7 @@ Usage (Colab):
     python -m task2_attention.run_task2 2b --stage train      # 42-run MQAR grid
     python -m task2_attention.run_task2 2b --stage sweep      # forward-only sweep
     python -m task2_attention.run_task2 2b --runs B1          # subset (B1|B2|B3|attn|run names)
-    python -m task2_attention.run_task2 2c --stage c1         # C1 cache validation
+    python -m task2_attention.run_task2 2c --stage c1         # C1 cache validation (re-run if criterion_version is stale)
     python -m task2_attention.run_task2 2c --stage eval       # C2-C5: 180 prompts x 6 methods
     python -m task2_attention.run_task2 2c --stage bench      # C5 packed encode/decode benchmark
     python -m task2_attention.run_task2 aggregate             # every table / plot
@@ -65,6 +65,20 @@ def cmd_2a(args):
     return out
 
 
+def c1_needs_recompute(path, overwrite: bool, version: int) -> bool:
+    """C1 is (re)computed when --overwrite is set, when c1_validation.json is missing or
+    unreadable, or when its "criterion_version" differs from `version` (files written
+    before the field existed have no version and are therefore recomputed)."""
+    from common.runio import read_json
+    p = Path(path)
+    if overwrite or not p.exists():
+        return True
+    try:
+        return read_json(p).get("criterion_version") != version
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
 def cmd_2c(args):
     from task2_attention import part_c
     from common.runio import read_json, write_json
@@ -76,7 +90,7 @@ def cmd_2c(args):
     out = {}
     if args.stage in ("c1", "all"):
         p = root / "c1_validation.json"
-        if args.overwrite or not p.exists():
+        if c1_needs_recompute(p, args.overwrite, part_c.C1_CRITERION_VERSION):
             cases = part_c.load_cases(args.data_repo)
             pick = [next(c for c in cases if c["target_tokens"] == t and c["position"] == pos)
                     for t in (2048, 4096) for pos in ("start", "end")]

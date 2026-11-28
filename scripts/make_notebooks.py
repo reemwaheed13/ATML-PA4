@@ -1,8 +1,17 @@
 """Regenerate notebooks/02_task2.ipynb and notebooks/03_task3.ipynb from the cell
 sources below (style copied from notebooks/01_task1.ipynb: numbered cells, each
 printing PASS or FAIL).  Run:  python scripts/make_notebooks.py
+
+Both notebooks are built for Colab "Runtime > Run all" on a fresh runtime, against
+existing Drive results, with no manual edits, flags or restarts:
+  * setup / check cells print FAIL and then RAISE, so Run all stops there;
+  * experiment cells print PASS / FAIL and never raise (any exception while reading
+    their outputs is reported as FAIL), so one failed stage does not block later ones;
+  * every driver stage is resumable and skips finished work, so every PASS check also
+    holds on a rerun where everything is skipped.
 """
 import json
+import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +34,29 @@ def write(name, cells):
     nb = {"cells": cells, "metadata": META, "nbformat": 4, "nbformat_minor": 0}
     (ROOT / "notebooks" / name).write_text(json.dumps(nb, indent=1) + "\n")
     print("wrote", name, len(cells), "cells")
+
+
+def _indent(s):
+    return textwrap.indent(s.strip("\n"), "    ")
+
+
+def experiment_cell(header, pre, check):
+    """`pre` runs the driver; `check` reads its outputs and prints PASS/FAIL.  Any
+    exception in `check` is printed as FAIL and swallowed (Run all continues)."""
+    return code(header.strip("\n") + "\n" + pre.strip("\n") + "\ntry:\n" + _indent(check) + "\n"
+                "except Exception as e:  # report FAIL; never stop Run all (later stages are independent)\n"
+                "    print(f'FAIL ({type(e).__name__}: {e})')\n")
+
+
+def halting_cell(cell_no, header, pre, check):
+    """Setup / check cell: `check` must set `ok` and print PASS/FAIL; on FAIL (or any
+    exception) the cell raises after printing FAIL, so Run all stops here."""
+    return code(header.strip("\n") + "\n" + pre.strip("\n") + "\nok = False\ntry:\n" + _indent(check) + "\n"
+                "except Exception as e:\n"
+                "    print(f'FAIL ({type(e).__name__}: {e})')\n"
+                "    raise\n"
+                "if not ok:\n"
+                f"    raise RuntimeError('Cell {cell_no} FAIL: setup/check cell, stopping Run all here')\n")
 
 
 # ── shared setup cells ────────────────────────────────────────────────────────
@@ -50,7 +82,10 @@ missing = [f for f in FILES if not os.path.exists(f'{{DATA_REPO}}/{{f}}')]
 print('HF_HOME     :', HF_HOME)
 print('DATA_REPO   :', DATA_REPO)
 print('RESULTS_ROOT:', RESULTS_ROOT + '/{results_sub}')
-print('PASS' if not missing else f'FAIL: missing {{missing}}')
+ok = not missing
+print('PASS' if ok else f'FAIL: missing {{missing}}')
+if not ok:
+    raise RuntimeError('Cell 1 FAIL: setup cell, stopping Run all here')
 '''),
         code('''
 # Cell 2: clone / pull repo
@@ -62,25 +97,41 @@ if os.path.isdir(REPO_DIR + '/.git'):
 else:
     r = subprocess.run(['git', 'clone', REPO_URL, REPO_DIR], capture_output=True, text=True)
 print(r.stdout.strip() or r.stderr.strip())
-os.chdir(REPO_DIR)
-if REPO_DIR not in sys.path:
-    sys.path.insert(0, REPO_DIR)
-head = subprocess.run(['git', 'log', '--oneline', '-1'], capture_output=True, text=True).stdout.strip()
-print('HEAD:', head)
-print('PASS' if r.returncode == 0 and os.path.exists('%s') else 'FAIL')
+ok = r.returncode == 0 and os.path.exists(REPO_DIR + '/%s')
+if ok:
+    os.chdir(REPO_DIR)
+    if REPO_DIR not in sys.path:
+        sys.path.insert(0, REPO_DIR)
+    head = subprocess.run(['git', 'log', '--oneline', '-1'], capture_output=True, text=True).stdout.strip()
+    print('HEAD:', head)
+print('PASS' if ok else 'FAIL')
+if not ok:
+    raise RuntimeError('Cell 2 FAIL: setup cell, stopping Run all here')
 ''' % task),
         code('''
-# Cell 3: pinned versions (handout: transformers==4.57.1, huggingface_hub==0.36.2)
+# Cell 3: pinned versions (handout: transformers==4.57.1, huggingface_hub==0.36.2) and no torchao.
+# Colab ships torchao 0.10.0, which the installed peft rejects ("only versions above 0.16.0 are
+# supported") when it creates any LoRA layer; nothing in this repo uses torchao, so it is removed.
+# No earlier cell imports transformers / peft / torch in this kernel (every stage runs in a
+# subprocess), so no runtime restart is needed.
 r = subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
                     'transformers==4.57.1', 'huggingface_hub==0.36.2', 'peft>=0.14.0'], capture_output=True, text=True)
 print(r.stderr[-2000:] if r.returncode else 'pip OK')
+u = subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', 'torchao'], capture_output=True, text=True)
+print((u.stdout.strip() or u.stderr.strip())[-500:] if u.returncode == 0 else u.stderr[-2000:])
+t = subprocess.run([sys.executable, '-c', "import importlib.util; print(importlib.util.find_spec('torchao') is None)"],
+                   capture_output=True, text=True)
+no_torchao = u.returncode == 0 and t.stdout.strip() == 'True'
+print('torchao absent:', no_torchao)
 v = subprocess.run([sys.executable, '-c',
                     'import transformers, huggingface_hub, torch;'
                     'print(transformers.__version__, huggingface_hub.__version__, torch.__version__, torch.cuda.is_available())'],
                    capture_output=True, text=True).stdout.split()
 print('transformers, huggingface_hub, torch, cuda:', v)
-ok = r.returncode == 0 and v[:2] == ['4.57.1', '0.36.2'] and v[3] == 'True'
-print('PASS' if ok else 'FAIL (if transformers was already imported in this kernel, restart the runtime and rerun from cell 1)')
+ok = r.returncode == 0 and no_torchao and len(v) >= 4 and v[:2] == ['4.57.1', '0.36.2'] and v[3] == 'True'
+print('PASS' if ok else 'FAIL')
+if not ok:
+    raise RuntimeError('Cell 3 FAIL: setup cell, stopping Run all here')
 '''),
         code('''
 # Cell 4: CPU unit tests
@@ -88,7 +139,10 @@ r = subprocess.run([sys.executable, '-m', 'pytest', '-q', 'tests'], capture_outp
                    env={**os.environ, 'CUDA_VISIBLE_DEVICES': ''})
 print(r.stdout[-4000:])
 print(r.stderr[-2000:])
-print('PASS' if r.returncode == 0 else 'FAIL')
+ok = r.returncode == 0
+print('PASS' if ok else 'FAIL')
+if not ok:
+    raise RuntimeError('Cell 4 FAIL: setup cell, stopping Run all here')
 '''),
     ]
 
@@ -103,39 +157,47 @@ def run_driver(module, args):
     return p.wait()
 '''
 
+RUN_ALL_NOTE = '''Run top-to-bottom (Colab "Runtime > Run all" on a fresh runtime; no edits, flags or restarts).
+Every code cell prints `PASS` or `FAIL`. Setup / check cells ({halting}) raise after `FAIL`, so Run all
+stops there; experiment cells print `FAIL` and continue, so one failed stage does not block later,
+independent stages.'''
+
 # ── 02_task2 ──────────────────────────────────────────────────────────────────
 
 T2_INTRO = md('''
 # 02_task2 — PA4 Task 2 (attention, MQAR, KV memory) on Colab L4
 
-Run top-to-bottom. Every code cell prints `PASS` or `FAIL`. Results go to Drive
-(`/content/drive/MyDrive/atml_pa4_results/task2`), never to the repo. Every stage is
-resumable: re-running a cell after a disconnect skips finished runs; a failed run writes
-`error.json` and the driver continues.
+''' + RUN_ALL_NOTE.format(halting='1-4') + '''
+Results go to Drive (`/content/drive/MyDrive/atml_pa4_results/task2`), never to the repo. Every stage
+is resumable: finished runs are skipped; a failed run writes `error.json`, the driver continues, and
+the next run of the cell retries it. The C1 validation is recomputed automatically when its stored
+pass criterion is out of date (`criterion_version`).
 
 | Cell | What it does | Est. L4 time |
 |---|---|---|
 | 1 | Mount Drive, set HF_HOME, check the data files | <1 min |
 | 2 | Clone / pull the repo | <1 min |
-| 3 | Install pinned transformers / huggingface_hub / peft | 1 min |
+| 3 | Install pinned transformers / huggingface_hub / peft, remove torchao | 1 min |
 | 4 | CPU unit tests | 3-5 min |
-| 5 | 2B: the 42-run MQAR grid (B1, B2, B3 x 3 seeds) | ~1-1.5 h (first call also builds 6 training streams, ~10 min) |
-| 6 | 2B: forward-only sweep T in {256,1024,4096,8192} | ~5 min |
-| 7 | 2A: dense / tiled / SDPA sweep (FP32+FP16, L 256..8192) + causality, tile, edge-case checks | ~15-25 min |
-| 8 | 2C: C1 cache validation (split prefill, 100% retention, scoring vs SDPA) | ~2 min |
-| 9 | 2C: 180 prompts x 6 cache methods (C2-C5) | ~20-30 min |
-| 10 | 2C: C5 packed encode/decode benchmark (B 1/8, L 2048/4096) | ~5 min |
-| 11 | Aggregate: every Task 2 table and plot | ~2 min |
+| 5 | 2B: MQAR grid, B1 + B2 (39 runs = 13 configs x 3 seeds) | ~1-1.5 h (first call also builds 6 training streams, ~10 min) |
+| 6 | 2B: B3 intervention (3 runs; fixed a priori in B3_SPEC) | ~5-10 min |
+| 7 | 2B: forward-only sweep T in {256,1024,4096,8192} | ~5 min |
+| 8 | 2A: dense / tiled / SDPA sweep (FP32+FP16, L 256..8192) + causality, tile, edge-case checks | ~15-25 min |
+| 9 | 2C: C1 cache validation (split prefill, 100% retention, scoring vs SDPA) + KV quantisation diagnostic | ~2 min |
+| 10 | 2C: 180 prompts x 6 cache methods (C2-C5) | ~20-30 min |
+| 11 | 2C: C5 packed encode/decode benchmark (B 1/8, L 2048/4096) | ~5 min |
+| 12 | Aggregate: every Task 2 table and plot | ~2 min |
 ''')
 
-T2_B_GRID = code('''
-# Cell 5: 2B - full 42-run MQAR grid (resumable; rerun after a disconnect)
-''' + DRIVER_HELPER + '''
-T2 = RESULTS_ROOT + '/task2'
-rc = run_driver('task2_attention.run_task2', ['2b', '--stage', 'train', '--runs', 'all',
+
+def _b_grid_cell(header, runs_arg, step_filter, n_runs, define_helper):
+    pre = (DRIVER_HELPER + "\nT2 = RESULTS_ROOT + '/task2'\n" if define_helper else "") + f"""
+rc = run_driver('task2_attention.run_task2', ['2b', '--stage', 'train', '--runs', {runs_arg!r},
                 '--data-repo', DATA_REPO, '--results-root', T2])
+"""
+    check = """
 man = json.load(open(f'{T2}/b/grid_manifest.json'))
-runs = [g['run'] for g in man['grid']]
+runs = [g['run'] for g in man['grid'] if g['step'] STEP_FILTER]
 done = [r for r in runs if os.path.exists(f'{T2}/b/runs/{r}/summary.json')]
 failed = [r for r in runs if os.path.exists(f'{T2}/b/runs/{r}/error.json')]
 print(f"data check: {man['data_check']}")
@@ -147,14 +209,24 @@ for r in done:
     flag = '  FAILED-TO-LEARN' if s['failed_to_learn'] else ''
     print('%-30s near %.3f far %.3f mixed %.3f  %.1f ms/upd%s' % (
         r, acc['near'], acc['far'], acc['mixed'], s['train_stats']['ms_per_update'], flag))
-print('PASS' if rc == 0 and len(runs) == 42 and len(done) == 42 else 'FAIL')
-''')
+print('PASS' if rc == 0 and len(runs) == N_RUNS and len(done) == N_RUNS else 'FAIL')
+""".replace("STEP_FILTER", step_filter).replace("N_RUNS", str(n_runs))
+    return experiment_cell(header, pre, check)
 
-T2_B_SWEEP = code('''
-# Cell 6: 2B - forward-only inference sweep (fixed random embeddings, B=4, H=4, d=32)
+
+T2_B_GRID = _b_grid_cell("# Cell 5: 2B - MQAR grid, B1 + B2 only (39 runs; resumable)",
+                         'B1,B2', "in ('B1', 'B2')", 39, True)
+
+T2_B3 = _b_grid_cell("# Cell 6: 2B - B3 intervention (3 runs; resumable; B3_SPEC in task2_attention/part_b.py)",
+                     'B3', "== 'B3'", 3, False)
+
+T2_B_SWEEP = experiment_cell('''
+# Cell 7: 2B - forward-only inference sweep (fixed random embeddings, B=4, H=4, d=32)
+''', '''
 rc = run_driver('task2_attention.run_task2', ['2b', '--stage', 'sweep', '--results-root', T2])
+''', '''
 import glob
-recs = [json.load(open(f)) for f in sorted(glob.glob(f'{T2}/b/forward_sweep/*_T*.json')) if 'error' not in f]
+recs = [json.load(open(f)) for f in sorted(glob.glob(f'{T2}/b/forward_sweep/*_T*.json')) if not f.endswith('.error.json')]
 for r in sorted(recs, key=lambda r: (r['method'], r['T'])):
     print(f"{r['method']:17s} T={r['T']:5d} {r['status']:4s} {r.get('mean_ms', float('nan')):9.2f} ms  "
           f"peak {r.get('peak_alloc_mb', float('nan')):8.0f} MB  [{r['materializes']}]")
@@ -162,9 +234,11 @@ print('PASS' if rc == 0 and len(recs) == 24 else 'FAIL')
 ''')
 
 
-T2_A = code('''
-# Cell 7: 2A - attention operators (resumable per dtype x L x method)
+T2_A = experiment_cell('''
+# Cell 8: 2A - attention operators (resumable per dtype x L x method)
+''', '''
 rc = run_driver('task2_attention.run_task2', ['2a', '--results-root', T2])
+''', '''
 import glob
 recs = [json.load(open(f)) for f in sorted(glob.glob(f'{T2}/a/conditions/*.json')) if not f.endswith('.error.json')]
 errs = sorted(glob.glob(f'{T2}/a/conditions/*.error.json'))
@@ -182,21 +256,29 @@ print('errors:', errs)
 print('PASS' if rc == 0 and len(recs) == 6 * 2 * 7 and not errs and causal_ok else 'FAIL')
 ''')
 
-T2_C1 = code('''
-# Cell 8: 2C - C1 validation of the FP16 cache path (run before interpreting compressed caches)
+T2_C1 = experiment_cell('''
+# Cell 9: 2C - C1 validation of the FP16 cache path (run before interpreting compressed caches);
+# recomputed automatically when c1_validation.json predates the current pass criterion
+''', '''
 rc = run_driver('task2_attention.run_task2', ['2c', '--stage', 'c1', '--data-repo', DATA_REPO, '--results-root', T2])
+''', '''
 c1 = json.load(open(f'{T2}/c/c1_validation.json'))
+print('criterion_version:', c1.get('criterion_version'), '|', c1.get('note'))
 for c in c1['cases']:
     print(f"{c['id']}: Lctx={c['context_len']} max|dlogit|={c['split_vs_full_max_abs_logit_diff']:.3e} "
-          f"argmax agree={c['split_vs_full_argmax_agreement']:.3f} greedy==100%-retention:{c['full_retention_matches_greedy']} "
+          f"argmax agree={c['split_vs_full_argmax_agreement']:.3f} n_mismatches={len(c.get('mismatch_positions', []))} "
+          f"near-tie:{c.get('all_mismatches_near_tie')} last-pos agree:{c.get('last_position_argmax_agrees')} "
+          f"greedy==100%-retention:{c['full_retention_matches_greedy']} "
           f"finite:{c['all_logits_finite']} scoring err={c['scoring_manual_vs_sdpa_max_abs_err']:.2e} "
           f"cache unchanged:{c['scoring_cache_unchanged']}")
 print('PASS' if rc == 0 and c1['pass'] else 'FAIL')
 ''')
 
-T2_C_EVAL = code('''
-# Cell 9: 2C - every KV-cache method on all 180 prompts (resumable per prompt)
+T2_C_EVAL = experiment_cell('''
+# Cell 10: 2C - every KV-cache method on all 180 prompts (resumable per prompt)
+''', '''
 rc = run_driver('task2_attention.run_task2', ['2c', '--stage', 'eval', '--data-repo', DATA_REPO, '--results-root', T2])
+''', '''
 import glob
 P = [json.load(open(f)) for f in glob.glob(f'{T2}/c/prompts/*/summary.json')]
 errs = glob.glob(f'{T2}/c/prompts/*/error.json')
@@ -210,9 +292,11 @@ print(f'{len(P)}/180 prompts, errors: {len(errs)}')
 print('PASS' if rc == 0 and len(P) == 180 and not errs else 'FAIL')
 ''')
 
-T2_C_BENCH = code('''
-# Cell 10: 2C - C5 packed-cache encode/decode benchmark (10 warmed, synchronized reps)
+T2_C_BENCH = experiment_cell('''
+# Cell 11: 2C - C5 packed-cache encode/decode benchmark (10 warmed, synchronized reps)
+''', '''
 rc = run_driver('task2_attention.run_task2', ['2c', '--stage', 'bench', '--data-repo', DATA_REPO, '--results-root', T2])
+''', '''
 rows = json.load(open(f'{T2}/c/packed_bench.json'))
 for r in rows:
     print('%-32s B=%d L=%d pack %.2f ms unpack %.2f ms step+unpack %.2f ms vs fp16 %.2f ms bytes %d (==formula %s)' % (
@@ -222,12 +306,14 @@ for r in rows:
 print('PASS' if rc == 0 and len(rows) == 12 and all(r['bytes_match_formula'] for r in rows) else 'FAIL')
 ''')
 
-T2_AGG = code('''
-# Cell 11: aggregate - every Task 2 table (tables/*.csv|json) and plot (plots/*.png)
+T2_AGG = experiment_cell('''
+# Cell 12: aggregate - every Task 2 table (tables/*.csv|json) and plot (plots/*.png)
+''', '''
 rc = run_driver('task2_attention.run_task2', ['aggregate', '--results-root', T2])
+''', '''
 st = json.load(open(f'{T2}/tables/aggregate_status.json'))
 for part, v in st.items():
-    print(part, v.get('status'), {k: v[k] for k in v if k in ('n_conditions', 'n_runs', 'missing_runs', 'n_prompts', 'c1_validation', 'error')})
+    print(part, v.get('status'), {k: v[k] for k in v if k in ('n_conditions', 'n_runs', 'missing_runs', 'n_prompts', 'c1_validation', 'c1_cases', 'error')})
 print('tables:', sorted(os.listdir(f'{T2}/tables')))
 print('plots :', sorted(os.listdir(f'{T2}/plots')))
 print('PASS' if rc == 0 and all(v.get('status') == 'ok' for v in st.values()) else 'FAIL')
@@ -238,7 +324,7 @@ def nb2():
     cells = [T2_INTRO] + setup_cells('task2_attention/run_task2.py', 'task2',
                                      ['data/mqar/mqar_test.jsonl.gz', 'data/mqar/mqar_development.jsonl.gz',
                                       'scripts/mqar_generator.py', 'data/kv_retrieval/kv_retrieval_cases.jsonl.gz'])
-    cells += [T2_B_GRID, T2_B_SWEEP, T2_A, T2_C1, T2_C_EVAL, T2_C_BENCH, T2_AGG]
+    cells += [T2_B_GRID, T2_B3, T2_B_SWEEP, T2_A, T2_C1, T2_C_EVAL, T2_C_BENCH, T2_AGG]
     write("02_task2.ipynb", cells)
 
 # ── 03_task3 ──────────────────────────────────────────────────────────────────
@@ -247,13 +333,15 @@ T3_INTRO = md("""
 # 03_task3 — PA4 Task 3 (exact speculative sampling + LoRA policy distillation) on Colab L4
 
 Target/teacher `Qwen/Qwen2.5-1.5B-Instruct`, draft/student `Qwen/Qwen2.5-0.5B-Instruct` (FP16, SDPA).
-Run top-to-bottom; every code cell prints `PASS` or `FAIL`. Results go to Drive
-(`/content/drive/MyDrive/atml_pa4_results/task3`). Every stage is resumable (finished units are
-skipped; a failed unit writes `error.json` and the driver continues).
+""" + RUN_ALL_NOTE.format(halting='1-6') + """
+Results go to Drive (`/content/drive/MyDrive/atml_pa4_results/task3`). Every stage is resumable:
+finished units are skipped; a failed unit writes `error.json`, the driver continues, and the next run
+of the cell retries it. A stored `check` / `validate` result that failed, and a `costs` summary that
+lacks a draft that has since become available, are recomputed automatically.
 
 | Cell | Stage | Est. L4 time |
 |---|---|---|
-| 1-4 | setup + CPU tests | ~6 min |
+| 1-4 | setup (incl. torchao removal) + CPU tests | ~6 min |
 | 5 | `check`: tokenizer / chat-template agreement, split disjointness, bank prompts | 1 min |
 | 6 | `validate`: chi^2 (gamma 2, 4) + negative control, split prefill, cache consistency | 3 min |
 | 7 | `bank_spec`: exact_spec_original_gamma4 bank with our sampler | ~8 min |
@@ -270,13 +358,19 @@ skipped; a failed unit writes `error.json` and the driver continues).
 | 18 | aggregate | ~2 min |
 """)
 
+HALTING_T3 = (5, 6)
+
+
 def t3(cell_no, title, args, check):
-    return code(f"""
-# Cell {cell_no}: {title}
-""" + (DRIVER_HELPER if cell_no == 5 else "") + f"""
+    header = f"# Cell {cell_no}: {title}"
+    pre = (DRIVER_HELPER if cell_no == 5 else "") + f"""
 T3 = RESULTS_ROOT + '/task3'
 rc = run_driver('task3_specdec.run_task3', {args!r} + ['--data-repo', DATA_REPO, '--results-root', T3])
-""" + check)
+"""
+    if cell_no in HALTING_T3:
+        return halting_cell(cell_no, header, pre, check)
+    return experiment_cell(header, pre, check)
+
 
 T3_CELLS = [
     t3(5, "check: tokenizer / chat template agreement, train-test disjointness, bank prompt text", ['check'], """
@@ -284,7 +378,8 @@ c = json.load(open(f'{T3}/check.json'))
 print('template mismatches:', c['chat_template_token_mismatches'], 'vocab equal:', c['vocab_equal'])
 print('splits:', c['splits']); print('banks:', c['supplied_banks'])
 print(c['example_prompt'])
-print('PASS' if rc == 0 and c['pass'] else 'FAIL')
+ok = rc == 0 and c['pass']
+print('PASS' if ok else 'FAIL')
 """),
     t3(6, "validate: chi^2 on the shared round function + real-model cache checks", ['validate'], """
 v = json.load(open(f'{T3}/sampler_validation.json'))
@@ -293,9 +388,9 @@ for r in v['chi2']:
           f"min expected={r['min_expected']:.0f} rejected={r['rejected_at_0.01']}")
 for c in v['real_model_checks']:
     print(c)
-ok = v['chi2_pass'] and all(c.get('argmax_equal', True) for c in v['real_model_checks']) and \
-     all(c.get('max_verify_logit_err_vs_full_forward', 0) < 0.5 for c in v['real_model_checks'])
-print('PASS' if rc == 0 and ok else 'FAIL')
+ok = (rc == 0 and v['chi2_pass'] and all(c.get('argmax_equal', True) for c in v['real_model_checks'])
+      and all(c.get('max_verify_logit_err_vs_full_forward', 0) < 0.5 for c in v['real_model_checks']))
+print('PASS' if ok else 'FAIL')
 """),
     t3(7, "bank_spec: exact-speculative consistency bank (original draft, gamma 4, our sampler)", ['bank_spec'], """
 m = json.load(open(f'{T3}/banks/exact_spec_original_gamma4.meta.json'))

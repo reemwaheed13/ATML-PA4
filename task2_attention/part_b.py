@@ -296,12 +296,14 @@ def run_sweep(results_root: str, device: str, overwrite: bool = False, Ts=SWEEP_
         for T in Ts:
             f = out / f"{m}_T{T}.json"
             if f.exists() and not overwrite:
+                (out / f"{f.stem}.error.json").unlink(missing_ok=True)     # finished: error file is stale
                 status[f.stem] = "skipped"
                 continue
             try:
                 rec = _sweep_one(m, T, device, n_warmup, n_rep)
                 rec["env"] = _env(device)
                 write_json(f, rec)
+                (out / f"{f.stem}.error.json").unlink(missing_ok=True)     # stale error from an earlier attempt
                 status[f.stem] = rec["status"]
                 log(f"[sweep] {m} T={T}: {rec['status']} "
                     f"{rec.get('mean_ms', float('nan')):.2f} ms, peak {rec.get('peak_alloc_mb', float('nan')):.0f} MB")
