@@ -107,9 +107,9 @@ Requirements checklist: `docs/REQUIREMENTS_T2T3.md` (state before this session).
 
 ### Decisions (see README deviations e–m)
 - B3 = `local_linear` (2 local W=33 FP16-buffer heads + 2 linear heads), state bytes equal to
-  linear. **Chosen before B1/B2 results exist** — if the observed results suggest a different
-  intervention, change `part_b.GRID_CONFIGS[-1]` / `B3_SPEC` and the `local_linear` operator
-  before running B3.
+  linear. Fixed a priori, before B1/B2 results existed, and final: `GRID_CONFIGS` / `B3_SPEC`
+  are not to be changed. It was evaluated before the B1/B2 review and kept, because replacing
+  it after seeing its test results would select on the test set (README deviation g).
 - Test-time controls for dense models: W=64 window and content top-64 (RQ2), evaluation only.
 
 ### Not verified here (no GPU / no local pytest in this session)
