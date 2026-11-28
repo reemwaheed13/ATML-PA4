@@ -123,3 +123,33 @@ Requirements checklist: `docs/REQUIREMENTS_T2T3.md` (state before this session).
 
 ### Skipped: optional
 - Additional readings (§2, §3) and the cross-task discussion (§4, "not required").
+
+---
+
+## Session E — results export (2026-11-28)
+
+Gap: Task 2/3 drivers write only to Drive, but §4 Deliverables needs machine-readable
+per-condition and per-example results in the public repo.
+
+### Done (`2169e47`)
+- `scripts/export_results.py --results-root <drive root> --task {2,3}` copies a whitelist into
+  `<staging>/results/task{N}/` and zips it. It takes `tables/*.csv|json`, `plots/*.png`,
+  `*summary.json`, `curves.json`, `grid_manifest.json`, `c1_validation.json`, `a/checks.json`,
+  `check.json` / `sampler_validation.json` (χ²), per-condition records (`a/conditions/`,
+  `b/forward_sweep/`, `packed_bench.json`), and per-prompt `spec/*/{primary,fixed64}.jsonl.gz`,
+  `standalone/*/rows.jsonl.gz`, `banks/**.jsonl.gz` and `*.meta.json`.
+- It never copies `.pt/.bin/.safetensors/.npz`, `adapter/`, `merged/`, `_train_cache/`,
+  optimizer / ckpt / error files, a teacher pool > 5 MB, or any file > 20 MB. Every skipped
+  file is printed with its size and reason. `EXPORT_MANIFEST.json` gives the sha256 and size of
+  each copied file and also lists the skipped files.
+- The final notebook cells (02 cell 13, 03 cell 19) write
+  `atml_pa4_results/export_task{2,3}.zip`. PASS means every manifest hash matches the zip,
+  no file is over the cap, and there is at least one table. README "Results" note added.
+- `tests/test_export_results.py` covers the whitelist, deny list, caps, hashes and zip
+  (4 tests, passed locally).
+
+### Open
+- `results/task2/` and `results/task3/` are still empty (`.gitkeep`). Run the export cells on
+  Colab, unzip both archives at the repo root, and commit.
+- The full pytest suite was not run in this session (no torch / transformers locally). Notebook
+  cell 4 runs it.
