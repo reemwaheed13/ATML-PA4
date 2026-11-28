@@ -39,6 +39,11 @@ repositories and revisions used to regenerate the banks are recorded in
    Every driver is resumable: it skips finished runs, and a failed run writes `error.json`
    while the driver continues. Each `aggregate` step writes `tables/` (CSV/JSON) and `plots/`.
 
+**Results:** `results/task2/` and `results/task3/` are exported from the Colab runs via
+`scripts/export_results.py` (the final notebook cell writes `atml_pa4_results/export_task{2,3}.zip`;
+unzip it at the repo root), and every reported number traces to those files; each export's
+`EXPORT_MANIFEST.json` lists every file with its sha256 and size.
+
 Environment: `transformers==4.57.1`, `huggingface_hub==0.36.2` (pinned by the handout),
 plus `requirements.txt`. Seeds: 6304 throughout (MQAR runs also use 6305 and 6306; Task 3 distillation uses 6304 and 6305).
 CPU tests: `python -m pytest -q tests`.

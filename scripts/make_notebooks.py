@@ -59,6 +59,28 @@ def halting_cell(cell_no, header, pre, check):
                 f"    raise RuntimeError('Cell {cell_no} FAIL: setup/check cell, stopping Run all here')\n")
 
 
+
+def export_cell(cell_no, task):
+    """Final cell: export the machine-readable results to a zip on Drive (scripts/export_results.py)."""
+    return experiment_cell(f"""
+# Cell {cell_no}: export machine-readable results (tables, plots, summaries, per-example records) -> zip on Drive
+""", f"""
+EXPORT_ZIP = RESULTS_ROOT + '/export_task{task}.zip'
+rc = run_driver('scripts.export_results', ['--results-root', RESULTS_ROOT, '--task', '{task}',
+                '--staging', '/content/export_task{task}', '--zip', EXPORT_ZIP])
+""", f"""
+import hashlib, zipfile
+with zipfile.ZipFile(EXPORT_ZIP) as zf:
+    man = json.loads(zf.read('results/task{task}/EXPORT_MANIFEST.json'))
+    bad = [f['path'] for f in man['files'] if hashlib.sha256(zf.read('results/task{task}/' + f['path'])).hexdigest() != f['sha256']]
+    big = [f['path'] for f in man['files'] if f['size'] > man['max_file_bytes']]
+n_tables = sum(f['path'].startswith('tables/') for f in man['files'])
+print(EXPORT_ZIP, round(os.path.getsize(EXPORT_ZIP) / 1e6, 2), 'MB:', man['n_files'], 'files,', n_tables, 'tables,',
+      len(man['skipped']), 'skipped; hash mismatches', bad, '; over cap', big)
+print('PASS' if rc == 0 and man['n_files'] > 0 and n_tables > 0 and not bad and not big else 'FAIL')
+""")
+
+
 # ── shared setup cells ────────────────────────────────────────────────────────
 
 def setup_cells(task, results_sub, files_check):
@@ -187,6 +209,7 @@ pass criterion is out of date (`criterion_version`).
 | 10 | 2C: 180 prompts x 6 cache methods (C2-C5) | ~20-30 min |
 | 11 | 2C: C5 packed encode/decode benchmark (B 1/8, L 2048/4096) | ~5 min |
 | 12 | Aggregate: every Task 2 table and plot | ~2 min |
+| 13 | Export tables / plots / summaries / per-example results to `atml_pa4_results/export_task2.zip` | ~1 min |
 ''')
 
 
@@ -324,7 +347,7 @@ def nb2():
     cells = [T2_INTRO] + setup_cells('task2_attention/run_task2.py', 'task2',
                                      ['data/mqar/mqar_test.jsonl.gz', 'data/mqar/mqar_development.jsonl.gz',
                                       'scripts/mqar_generator.py', 'data/kv_retrieval/kv_retrieval_cases.jsonl.gz'])
-    cells += [T2_B_GRID, T2_B3, T2_B_SWEEP, T2_A, T2_C1, T2_C_EVAL, T2_C_BENCH, T2_AGG]
+    cells += [T2_B_GRID, T2_B3, T2_B_SWEEP, T2_A, T2_C1, T2_C_EVAL, T2_C_BENCH, T2_AGG, export_cell(13, 2)]
     write("02_task2.ipynb", cells)
 
 # ── 03_task3 ──────────────────────────────────────────────────────────────────
@@ -356,6 +379,7 @@ lacks a draft that has since become available, are recomputed automatically.
 | 16 | `unmerged`: one unmerged adapter, wrapper overhead | ~3 min |
 | 17 | `standalone`: each draft's own accuracy (512 / 32 caps) | ~6 min |
 | 18 | aggregate | ~2 min |
+| 19 | export tables / plots / summaries / per-example results to `atml_pa4_results/export_task3.zip` | ~1 min |
 """)
 
 HALTING_T3 = (5, 6)
@@ -482,7 +506,7 @@ def nb3():
                                       'data/public_locked/gsm8k_test_locked.jsonl.gz',
                                       'data/short_form/short_train.jsonl', 'data/short_form/short_test.jsonl',
                                       'data/prefix_banks/prefix_banks_locked.jsonl.gz'])
-    cells += T3_CELLS
+    cells += T3_CELLS + [export_cell(19, 3)]
     write("03_task3.ipynb", cells)
 
 
